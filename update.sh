@@ -8,7 +8,6 @@ if [[ "$SOURCE_DIR" != "$INSTALL_DIR" ]]; then
   tar -C "$SOURCE_DIR" --exclude='./.git' --exclude='./.env' --exclude='./secrets' --exclude='./uploads' --exclude='./backups' --exclude='./caddy-root.crt' --exclude='./__pycache__' -cf - . | tar -C "$INSTALL_DIR" -xf -
 fi
 cd "$INSTALL_DIR"
-./backup.sh manual
 set -a
 . "$INSTALL_DIR/.env"
 set +a
@@ -23,6 +22,8 @@ if [[ ! -s "$INSTALL_DIR/secrets/nginx.crt" || ! -s "$INSTALL_DIR/secrets/nginx.
   chmod 644 "$INSTALL_DIR/secrets/nginx.crt"
 fi
 docker compose build app scanner
+./backup.sh manual
 docker compose pull web
+docker compose up -d
 docker compose up -d --force-recreate web
 echo "Update complete. Existing .env, database, uploads, and backups were preserved."
