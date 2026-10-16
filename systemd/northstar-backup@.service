@@ -1,0 +1,9 @@
+[Unit]
+Description=Northstar IT inventory %i backup
+Requires=docker.service
+After=docker.service
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/northstar-it
+ExecStart=/opt/northstar-it/backup.sh %i
+TimeoutStartSec=30min

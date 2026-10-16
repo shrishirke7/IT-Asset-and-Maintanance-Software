@@ -1,0 +1,8 @@
+[Unit]
+Description=Daily Northstar IT inventory backup
+[Timer]
+OnCalendar=*-*-* 01:30:00
+Persistent=true
+Unit=northstar-backup@daily.service
+[Install]
+WantedBy=timers.target

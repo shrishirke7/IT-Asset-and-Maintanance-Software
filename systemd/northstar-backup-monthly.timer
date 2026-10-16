@@ -1,0 +1,8 @@
+[Unit]
+Description=Monthly Northstar IT inventory backup
+[Timer]
+OnCalendar=*-*-01 03:30:00
+Persistent=true
+Unit=northstar-backup@monthly.service
+[Install]
+WantedBy=timers.target
