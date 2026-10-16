@@ -1,0 +1,75 @@
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: northstar
+      POSTGRES_USER: northstar
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+      TZ: ${TZ:-Asia/Kolkata}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U northstar -d northstar"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+    networks: [internal]
+
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:18000:8000"
+    dns:
+      - ${LDAP_DNS_SERVER:?set the Samba AD/DNS server IP in .env}
+    environment:
+      DATABASE_URL: postgresql://northstar:${DB_PASSWORD}@db:5432/northstar
+      UPLOAD_DIR: /app/uploads
+      COOKIE_SECURE: "true"
+    volumes:
+      - ./uploads:/app/uploads
+      - ./backups:/backups
+      - ./secrets/ad-ca.pem:/run/secrets/ad-ca.pem:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [internal]
+
+  scanner:
+    build: .
+    command: ["python", "scanner_agent.py"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SCANNER_URL: http://127.0.0.1:18000
+    network_mode: host
+    cap_add: [NET_RAW]
+    depends_on: [app]
+
+  web:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      APP_FQDN: ${APP_FQDN:?set APP_FQDN in .env}
+      CADDY_TLS_DIRECTIVE: ${CADDY_TLS_DIRECTIVE-tls internal}
+      HTTP_PORT: ${HTTP_PORT:-80}
+      HTTPS_PORT: ${HTTPS_PORT:-443}
+    ports:
+      - "${HTTP_PORT:-80}:${HTTP_PORT:-80}"
+      - "${HTTPS_PORT:-443}:${HTTPS_PORT:-443}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [app]
+    networks: [internal]
+
+networks:
+  internal:
+    driver: bridge
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:
