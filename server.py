@@ -2,6 +2,7 @@ import json
 import os
 import re
 import secrets
+import hashlib
 import subprocess
 import uuid
 import ipaddress
@@ -436,6 +437,161 @@ def logout():
 @signed_in
 def profile():
     return jsonify(profile=session["profile"], isAdmin=session["is_admin"])
+
+
+@app.get("/portal")
+def public_helpdesk_page():
+    return send_from_directory(ROOT, "portal.html")
+
+
+@app.get("/api/public/portal-options")
+def public_portal_options():
+    with db() as conn:
+        rows = {key: (conn.execute("SELECT value FROM app_state WHERE key=%s", (key,)).fetchone() or ([],))[0]
+                for key in ("manual_users", "departments", "settings")}
+    users = rows["manual_users"] if isinstance(rows["manual_users"], list) else []
+    departments = rows["departments"] if isinstance(rows["departments"], list) else []
+    settings = rows["settings"] if isinstance(rows["settings"], dict) else {}
+    factories = [{"code": str(f.get("code", "")).strip(), "name": str(f.get("name", "")).strip()}
+                 for f in settings.get("factories", []) if isinstance(f, dict) and f.get("code")]
+    for code in ("ARG", "ARB", "ARC", "ARF"):
+        if not any(f["code"].casefold() == code.casefold() for f in factories):
+            factories.append({"code": code, "name": code})
+    depts = []
+    for item in departments:
+        if isinstance(item, list) and len(item) > 6:
+            name, factory, kind = item[0], item[6] or item[1], item[8] if len(item) > 8 else "department"
+        elif isinstance(item, dict):
+            name, factory, kind = item.get("name", ""), item.get("factory", ""), item.get("kind", "department")
+        else:
+            continue
+        if name and factory and kind != "subdepartment":
+            depts.append({"name": str(name), "factory": str(factory)})
+    employees = []
+    for u in users:
+        if not isinstance(u, dict) or not u.get("enabled", True) or str(u.get("active", "Active")).lower() == "inactive":
+            continue
+        name = str(u.get("name") or "").strip()
+        dept = str(u.get("dept") or u.get("department") or "").strip()
+        site = str(u.get("site") or "").strip()
+        key = str(u.get("username") or u.get("id") or "").strip()
+        if name and dept and site and key:
+            public_key = hashlib.sha256((APP_SECRET + "|" + key.casefold() + "|" + dept.casefold() + "|" + site.casefold()).encode()).hexdigest()
+            employees.append({"key": public_key, "name": name, "department": dept, "factory": site})
+    return jsonify(factories=factories, departments=depts, employees=employees)
+
+
+@app.get("/api/public/tickets")
+def public_ticket_list():
+    kind = request.args.get("kind", "IT help desk")
+    if kind not in ("IT help desk", "Material request"):
+        return jsonify(error="Choose IT help desk or Material request."), 400
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT t.id,t.kind,t.display_name,t.department,t.factory,t.primary_category,t.sub_category,
+                   t.description,t.attachments,t.assigned_to,t.status,t.eta,t.note,t.created_at,t.updated_at,
+                   COALESCE((SELECT min(e.created_at) FROM ticket_events e WHERE e.ticket_id=t.id
+                             AND e.event_type='updated' AND e.detail ~ '(^|; )status: (Resolved|Closed)(;|$)'), t.updated_at)
+            FROM tickets t WHERE t.kind=%s ORDER BY t.created_at DESC LIMIT 5000
+        """, (kind,)).fetchall()
+    now = datetime.now(timezone.utc)
+    result = []
+    for r in rows:
+        end = r[15] if r[10] in ("Resolved", "Closed") else now
+        duration = max(0, int((end - r[13]).total_seconds() // 60))
+        photos = []
+        for item in (r[8] or []):
+            name = Path(str(item.get("path", ""))).name
+            if name and name == str(item.get("path", "")).split("/")[-1]:
+                photos.append({"name": str(item.get("name") or name)[:160], "url": "/api/public/ticket-attachment?id=" + quote(r[0], safe="") + "&file=" + quote(name, safe="")})
+        result.append({"id":r[0],"kind":r[1],"name":r[2],"department":r[3],"factory":r[4],"primary":r[5],"sub":r[6],
+                       "description":r[7],"photos":photos,"assigned":r[9],"status":r[10],
+                       "eta":r[11].isoformat(timespec="minutes") if r[11] else "","note":r[12],
+                       "created":r[13].isoformat(timespec="minutes"),"durationMinutes":duration})
+    return jsonify(tickets=result)
+
+
+@app.get("/api/public/ticket-attachment")
+def public_ticket_attachment():
+    ticket_id = request.args.get("id", "")
+    filename = request.args.get("file", "")
+    if not ticket_id or Path(filename).name != filename:
+        abort(404)
+    with db() as conn:
+        row = conn.execute("SELECT attachments FROM tickets WHERE id=%s", (ticket_id,)).fetchone()
+    if not row:
+        abort(404)
+    match = next((item for item in (row[0] or []) if Path(str(item.get("path", ""))).name == filename), None)
+    if not match:
+        abort(404)
+    parts = Path(str(match.get("path", ""))).parts
+    if len(parts) != 3 or parts[0] != "tickets" or Path(parts[2]).name != parts[2]:
+        abort(404)
+    return send_from_directory(UPLOAD_DIR / parts[0] / parts[1], parts[2], as_attachment=False)
+
+
+@app.post("/api/public/tickets")
+def create_public_ticket():
+    body = request.get_json(silent=True) or {}
+    factory = str(body.get("factory", "")).strip()[:80]
+    department = str(body.get("department", "")).strip()[:120]
+    employee_key = str(body.get("employee", "")).strip()[:120]
+    primary = str(body.get("primary", "IT help desk")).strip()[:80]
+    sub = str(body.get("sub", "")).strip()[:80]
+    description = str(body.get("description", "")).strip()[:5000]
+    kind = "Material request" if body.get("kind") == "Material request" else "IT help desk"
+    allowed_sub = {"Network", "Computer", "Printer", "Server", "Other", "ERP", "Software", "Manufacturing", "Laptop", "Desktop", "Monitor", "Network equipment", "Accessory"}
+    if not all((factory, department, employee_key, description, sub)) or sub not in allowed_sub:
+        return jsonify(error="Select your factory, department, name and issue category, then describe the issue."), 400
+    with db() as conn:
+        recent = conn.execute("SELECT count(*) FROM tickets WHERE client_ip=%s AND username LIKE 'public-%%' AND created_at>now()-interval '10 minutes'", (request.remote_addr or "127.0.0.1",)).fetchone()[0]
+        if recent >= 5:
+            return jsonify(error="Too many requests from this network. Please try again in a few minutes."), 429
+        state = {key: (conn.execute("SELECT value FROM app_state WHERE key=%s", (key,)).fetchone() or ([],))[0]
+                 for key in ("manual_users", "departments", "settings")}
+        users = state["manual_users"] if isinstance(state["manual_users"], list) else []
+        user = next((u for u in users if isinstance(u, dict)
+                     and hashlib.sha256((APP_SECRET + "|" + str(u.get("username") or u.get("id") or "").casefold() + "|" + str(u.get("dept") or u.get("department") or "").casefold() + "|" + str(u.get("site") or "").casefold()).encode()).hexdigest() == employee_key
+                     and str(u.get("dept") or u.get("department") or "").casefold() == department.casefold()
+                     and str(u.get("site") or "").casefold() == factory.casefold()
+                     and u.get("enabled", True) and str(u.get("active", "Active")).lower() != "inactive"), None)
+        if not user:
+            return jsonify(error="That employee is not active in the selected factory and department. Refresh the portal and choose again."), 400
+        depts = state["departments"] if isinstance(state["departments"], list) else []
+        dept_exists = any((str(d[0]).casefold() == department.casefold() and str((d[6] or d[1]) if len(d)>6 else "").casefold() == factory.casefold())
+                          if isinstance(d, list) and len(d)>1 else
+                          isinstance(d, dict) and str(d.get("name", "")).casefold() == department.casefold() and str(d.get("factory", "")).casefold() == factory.casefold()
+                          for d in depts)
+        custom_factories = (state["settings"] or {}).get("factories", []) if isinstance(state["settings"], dict) else []
+        factory_exists = factory.upper() in {"ARG", "ARB", "ARC", "ARF"} or any(isinstance(f, dict) and str(f.get("code", "")).casefold() == factory.casefold() for f in custom_factories)
+        if not dept_exists or not factory_exists:
+            return jsonify(error="The selected factory or department is no longer available. Refresh the portal."), 400
+        remote = request.remote_addr or "127.0.0.1"
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext(CURRENT_DATE::text))")
+        seq = conn.execute("SELECT count(*) FROM tickets WHERE created_at::date=CURRENT_DATE").fetchone()[0] + 1
+        token_date = datetime.now().strftime("%d-%m-%Y")
+        ticket_id = f"IT{seq:02d}/{token_date}"
+        tracking_token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(tracking_token.encode()).hexdigest()
+        username = "public-" + token_hash[:24]
+        conn.execute("INSERT INTO tickets(id,kind,username,display_name,department,factory,client_ip,primary_category,sub_category,description,public_token_hash) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                     (ticket_id, kind, username, str(user.get("name") or "")[:120], department, factory, remote, primary, sub, description, token_hash))
+        conn.execute("INSERT INTO ticket_events(ticket_id,actor,event_type,detail) VALUES(%s,'Public portal','created',%s)", (ticket_id, description[:500]))
+    return jsonify(id=ticket_id, tracking_token=tracking_token), 201
+
+
+@app.post("/api/public/tickets/status")
+def get_public_ticket_status():
+    tracking_token = str((request.get_json(silent=True) or {}).get("tracking_token", ""))
+    if not re.fullmatch(r"[A-Za-z0-9_-]{40,60}", tracking_token):
+        abort(404)
+    token_hash = hashlib.sha256(tracking_token.encode()).hexdigest()
+    with db() as conn:
+        row = conn.execute("SELECT id,status,eta,note,updated_at FROM tickets WHERE public_token_hash=%s", (token_hash,)).fetchone()
+    if not row:
+        abort(404)
+    return jsonify(id=row[0], status=row[1], eta=row[2].isoformat(timespec="minutes") if row[2] else "",
+                   note=row[3], updated=row[4].isoformat(timespec="minutes") if row[4] else "")
 
 
 @app.post("/api/account/profile-picture")
