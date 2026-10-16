@@ -138,8 +138,12 @@ def main():
     if len(TOKEN) < 40:
         raise SystemExit("APP_SECRET must be configured before the scanner agent starts")
     print("Northstar host-network scanner agent started", flush=True)
+    last_heartbeat = 0
     while True:
         try:
+            if time.monotonic() - last_heartbeat >= 6:
+                request_json("/api/internal/scanner-heartbeat", payload={}, timeout=5)
+                last_heartbeat = time.monotonic()
             task = request_json("/api/internal/scanner-task", timeout=5)
             if task:
                 print(f"Starting authorized scan {task['id']} over {task.get('total', 0)} addresses", flush=True)

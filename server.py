@@ -21,6 +21,8 @@ UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", ROOT / "uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 LOGIN_MEDIA_DIR = UPLOAD_DIR / "login-branding"
 LOGIN_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+PROFILE_MEDIA_DIR = UPLOAD_DIR / 'profiles'
+PROFILE_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 APP_SECRET = os.getenv("APP_SECRET", "")
 if len(APP_SECRET) < 40:
     raise RuntimeError("APP_SECRET must be a randomly generated secret of at least 40 characters")
@@ -48,7 +50,7 @@ def init_db():
         for statement in schema.split(";"):
             if statement.strip():
                 conn.execute(statement)
-        conn.execute("INSERT INTO app_state(key,value) VALUES('assets','[]'),('software','[]'),('departments','[]'),('maintenance','[]'),('manual_users','[]'),('network_ranges','[]'),('network_scan','{}'),('settings','{}') ON CONFLICT(key) DO NOTHING")
+        conn.execute("INSERT INTO app_state(key,value) VALUES('assets','[]'),('software','[]'),('departments','[]'),('maintenance','[]'),('manual_users','[]'),('network_ranges','[]'),('network_scan','{}'),('scanner_heartbeat','{}'),('settings','{}') ON CONFLICT(key) DO NOTHING")
 
 
 def signed_in(fn):
@@ -113,8 +115,8 @@ def initial_setup():
     full_name = str(body.get("full_name", "")).strip()[:120]
     username = str(body.get("username", "")).strip()[:80]
     password = str(body.get("password", ""))
-    if not company or not full_name or not re.fullmatch(r"[A-Za-z0-9._@-]{3,80}", username):
-        return jsonify(error="Enter the company name, administrator name, and a valid username (3–80 letters, numbers, dots, underscores, @, or hyphens)."), 400
+    if not full_name or not re.fullmatch(r"[A-Za-z0-9._@-]{3,80}", username):
+        return jsonify(error="Enter the administrator name and a valid username (3–80 letters, numbers, dots, underscores, @, or hyphens)."), 400
     if len(password) < 10 or len(password) > 1024:
         return jsonify(error="Choose a password with at least 10 characters."), 400
     with db() as conn:
@@ -130,8 +132,9 @@ def initial_setup():
         settings_row=conn.execute("SELECT value FROM app_state WHERE key='settings' FOR UPDATE").fetchone()
         settings=settings_row[0] if settings_row else {}
         branding=dict(settings.get("loginBranding", {}))
-        branding["companyName"]=company
-        settings.update(companyName=company,loginBranding=branding)
+        if company:
+            branding['companyName'] = company
+            settings.update(companyName=company, loginBranding=branding)
         conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='settings'",(json.dumps(settings),))
     return jsonify(ok=True, redirect="/"), 201
 
@@ -143,13 +146,19 @@ def get_login_branding():
     settings = row[0] if row else {}
     branding = settings.get("loginBranding", {})
     return jsonify({
-        "companyName": str(branding.get("companyName") or settings.get("companyName") or "Swarnshilp")[:120],
+        "companyName": str(branding.get("companyName") or settings.get("companyName") or "")[:120],
         "tagline": str(branding.get("tagline") or "Elegance in every connection")[:180],
         "logoUrl": str(branding.get("logoUrl") or "")[:300],
         "slides": branding.get("slides", [])[:5] if isinstance(branding.get("slides", []), list) else [],
         "slideInterval": max(3, min(30, int(branding.get("slideInterval", 6) or 6))),
     })
 
+
+@app.get("/profile-media/<path:filename>")
+def profile_media(filename):
+    if Path(filename).name != filename or Path(filename).suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+        abort(404)
+    return send_from_directory(PROFILE_MEDIA_DIR, filename, max_age=3600)
 
 @app.get("/login-media/<path:filename>")
 def login_media(filename):
@@ -179,7 +188,7 @@ def save_login_image(upload):
 @administrator
 def save_login_branding():
     try:
-        company = str(request.form.get("companyName", "Swarnshilp")).strip()[:120] or "Swarnshilp"
+        company = str(request.form.get("companyName", "")).strip()[:120]
         tagline = str(request.form.get("tagline", "Elegance in every connection")).strip()[:180] or "Elegance in every connection"
         try:
             interval = max(3, min(30, int(request.form.get("slideInterval", "6"))))
@@ -236,6 +245,7 @@ def network_scans():
     with db() as conn:
         ranges = (conn.execute("SELECT value FROM app_state WHERE key='network_ranges'").fetchone() or ([],))[0]
         saved = (conn.execute("SELECT value FROM app_state WHERE key='network_scan'").fetchone() or ({},))[0]
+        heartbeat = (conn.execute("SELECT value FROM app_state WHERE key='scanner_heartbeat'").fetchone() or ({},))[0]
     with NETWORK_SCAN_LOCK:
         state = dict(NETWORK_SCAN_STATE)
     if saved:
@@ -248,7 +258,12 @@ def network_scans():
                 _persist_network_scan(state, state.get("id", ""))
         except (ValueError, TypeError):
             pass
-    return jsonify(ranges=ranges, scan=state)
+    last_seen = heartbeat.get('last_seen', '')
+    try:
+        scanner_connected = bool(last_seen) and (datetime.now(timezone.utc) - datetime.fromisoformat(last_seen)).total_seconds() <= 20
+    except (ValueError, TypeError):
+        scanner_connected = False
+    return jsonify(ranges=ranges, scan=state, scannerConnected=scanner_connected)
 
 
 @app.put("/api/admin/network-scan/ranges")
@@ -308,6 +323,16 @@ def start_network_scan():
 def _scanner_authorized():
     supplied = request.headers.get("X-Northstar-Scanner", "")
     return bool(supplied) and secrets.compare_digest(supplied, APP_SECRET)
+
+
+@app.post("/api/internal/scanner-heartbeat")
+def scanner_heartbeat():
+    if not _scanner_authorized():
+        abort(403)
+    state = {"last_seen": datetime.now(timezone.utc).isoformat()}
+    with db() as conn:
+        conn.execute("INSERT INTO app_state(key,value) VALUES('scanner_heartbeat',%s::jsonb) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=now()", (json.dumps(state),))
+    return jsonify(ok=True)
 
 
 @app.get("/api/internal/scanner-task")
@@ -388,7 +413,7 @@ def login():
         except (ValueError, TypeError):
             valid_local = False
         if valid_local:
-            profile = {"username": str(local_user["username"]).lower(), "name": local_user.get("name") or local_user["username"], "email": local_user.get("email", ""), "dept": local_user.get("dept", ""), "site": local_user.get("site", ""), "role": local_user.get("role", "User"), "groups": []}
+            profile = {"username": str(local_user["username"]).lower(), "name": local_user.get("name") or local_user["username"], "email": local_user.get("email", ""), "dept": local_user.get("dept", ""), "site": local_user.get("site", ""), "role": local_user.get("role", "User"), "profile_picture": local_user.get("profile_picture", ""), "groups": []}
             with db() as conn:
                 conn.execute("DELETE FROM login_attempts WHERE client_ip=%s", (remote_ip,))
             session.clear()
@@ -412,6 +437,35 @@ def logout():
 def profile():
     return jsonify(profile=session["profile"], isAdmin=session["is_admin"])
 
+
+@app.post("/api/account/profile-picture")
+@signed_in
+def update_profile_picture():
+    upload = request.files.get("picture")
+    if not upload or not upload.filename:
+        return jsonify(error="Choose a profile picture first."), 400
+    ext = Path(upload.filename).suffix.lower()
+    if ext not in (".png", ".jpg", ".jpeg", ".webp"):
+        return jsonify(error="Use a PNG, JPG, or WebP image."), 400
+    data = upload.stream.read(2 * 1024 * 1024 + 1)
+    valid = (ext == ".png" and data.startswith(b"\x89PNG\r\n\x1a\n")) or (ext in (".jpg", ".jpeg") and data.startswith(b"\xff\xd8\xff")) or (ext == ".webp" and data.startswith(b"RIFF") and data[8:12] == b"WEBP")
+    if not data or len(data) > 2 * 1024 * 1024 or not valid:
+        return jsonify(error="Use a valid image up to 2 MB."), 400
+    username = session["profile"].get("username", "")
+    filename = uuid.uuid4().hex + ext
+    (PROFILE_MEDIA_DIR / filename).write_bytes(data)
+    picture_url = "/profile-media/" + filename
+    with db() as conn:
+        row = conn.execute("SELECT value FROM app_state WHERE key='manual_users' FOR UPDATE").fetchone()
+        users = row[0] if row else []
+        account = next((u for u in users if str(u.get("username", "")).casefold() == username.casefold()), None)
+        if not account:
+            (PROFILE_MEDIA_DIR / filename).unlink(missing_ok=True)
+            return jsonify(error="Local account was not found."), 404
+        account["profile_picture"] = picture_url
+        conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='manual_users'", (json.dumps(users),))
+    session["profile"]["profile_picture"] = picture_url
+    return jsonify(ok=True, profile_picture=picture_url)
 
 @app.post("/api/account/password")
 @signed_in
