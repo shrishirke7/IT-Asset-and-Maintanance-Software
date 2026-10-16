@@ -10,6 +10,7 @@ import threading
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
+from urllib.parse import quote
 
 import psycopg
 from flask import Flask, abort, jsonify, redirect, request, send_from_directory, session
@@ -68,6 +69,16 @@ def administrator(fn):
     @signed_in
     def wrapper(*args, **kwargs):
         if not session.get("is_admin"):
+            abort(403)
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def ticket_manager(fn):
+    @wraps(fn)
+    @signed_in
+    def wrapper(*args, **kwargs):
+        if not session.get("is_admin") and session.get("profile", {}).get("role") != "IT Ticketing":
             abort(403)
         return fn(*args, **kwargs)
     return wrapper
@@ -698,7 +709,7 @@ def save_data():
                         if "password_hash" not in user:
                             user["password_hash"] = ""
                         user["username"] = username
-                        user["role"] = "Administrator" if user.get("role") == "Administrator" else "User"
+                        user["role"] = user.get("role") if user.get("role") in ("Administrator", "IT Ticketing") else "User"
                         user["enabled"] = user.get("enabled", True)
                         clean.append(user)
                     if not any(u.get("enabled", True) and u.get("role") == "Administrator" and u.get("password_hash") for u in clean):
@@ -719,7 +730,7 @@ TICKET_COLUMNS = "id,kind,username,display_name,department,factory,client_ip,pri
 @signed_in
 def list_tickets():
     with db() as conn:
-        if session.get("is_admin"):
+        if session.get("is_admin") or session.get("profile", {}).get("role") == "IT Ticketing":
             rows = conn.execute(f"SELECT {TICKET_COLUMNS} FROM tickets ORDER BY created_at DESC LIMIT 1000").fetchall()
         else:
             rows = conn.execute(f"SELECT {TICKET_COLUMNS} FROM tickets WHERE username=%s ORDER BY created_at DESC LIMIT 250", (session["profile"]["username"],)).fetchall()
@@ -733,7 +744,7 @@ def ticket_attachment(ticket_id, filename):
         row = conn.execute("SELECT username,attachments FROM tickets WHERE id=%s", (ticket_id,)).fetchone()
     if not row:
         abort(404)
-    if not session.get("is_admin") and row[0] != session["profile"]["username"]:
+    if not session.get("is_admin") and session.get("profile", {}).get("role") != "IT Ticketing" and row[0] != session["profile"]["username"]:
         abort(403)
     match = next((item for item in row[1] if Path(item.get("path", "")).name == filename), None)
     if not match:
@@ -779,15 +790,19 @@ def create_ticket():
 
 
 @app.patch("/api/tickets/<path:ticket_id>")
-@administrator
+@ticket_manager
 def update_ticket(ticket_id):
     body = request.get_json(force=True)
     allowed = {"assigned":"assigned_to", "status":"status", "eta":"eta", "note":"note"}
-    fields = [(allowed[k], v) for k,v in body.items() if k in allowed]
+    fields = [(allowed[k], (None if k == "eta" and v == "" else v)) for k,v in body.items() if k in allowed]
     if not fields:
         return jsonify(error="No supported fields to update"), 400
     if "status" in body and body["status"] not in ("Open", "In progress", "Resolved", "Closed"):
         return jsonify(error="Invalid status"), 400
+    if "assigned" in body and len(str(body["assigned"])) > 160:
+        return jsonify(error="Assignee name is too long."), 400
+    if "eta" in body and body["eta"] not in (None, "") and len(str(body["eta"])) > 40:
+        return jsonify(error="Invalid ETA."), 400
     assignments = ", ".join(f"{column}=%s" for column,_ in fields)
     with db() as conn:
         cur = conn.execute(f"UPDATE tickets SET {assignments}, updated_at=now() WHERE id=%s RETURNING id", [v for _,v in fields]+[ticket_id])
@@ -796,6 +811,32 @@ def update_ticket(ticket_id):
         detail = "; ".join(f"{k}: {v}" for k,v in body.items() if k in allowed)[:1000]
         conn.execute("INSERT INTO ticket_events(ticket_id,actor,event_type,detail) VALUES(%s,%s,'updated',%s)", (ticket_id,session["profile"]["username"],detail))
     return jsonify(ok=True)
+
+
+@app.post("/api/tickets/<path:ticket_id>/worklog")
+@ticket_manager
+def add_ticket_worklog(ticket_id):
+    body = request.get_json(silent=True) or {}
+    detail = str(body.get("detail", "")).strip()
+    if not detail or len(detail) > 3000:
+        return jsonify(error="Enter a work update (up to 3000 characters)."), 400
+    actor = str(session.get("profile", {}).get("name") or session["profile"].get("username", "IT"))[:120]
+    with db() as conn:
+        row = conn.execute("UPDATE tickets SET note=%s,updated_at=now() WHERE id=%s RETURNING id", (detail, ticket_id)).fetchone()
+        if not row:
+            abort(404)
+        conn.execute("INSERT INTO ticket_events(ticket_id,actor,event_type,detail) VALUES(%s,%s,'worklog',%s)", (ticket_id, actor, detail))
+    return jsonify(ok=True)
+
+
+@app.get("/api/tickets/<path:ticket_id>/worklog")
+@ticket_manager
+def list_ticket_worklog(ticket_id):
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM tickets WHERE id=%s", (ticket_id,)).fetchone():
+            abort(404)
+        rows = conn.execute("SELECT actor,detail,created_at FROM ticket_events WHERE ticket_id=%s AND event_type IN ('created','updated','worklog') ORDER BY created_at DESC LIMIT 100", (ticket_id,)).fetchall()
+    return jsonify(events=[{"actor":r[0],"detail":r[1],"created":r[2].isoformat(timespec="minutes")} for r in rows])
 
 
 @app.get("/api/backups")
