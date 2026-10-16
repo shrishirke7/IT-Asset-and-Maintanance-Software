@@ -1,16 +1,16 @@
 # Northstar IT Inventory
 
-Northstar is a self-hosted IT inventory and help-desk web app for Ubuntu Server. It uses PostgreSQL for shared records, Samba AD DS over LDAPS or StartTLS for sign-in and directory sync, and Caddy for HTTPS. The browser prototype still opens directly from `index.html`; production sign-in and shared data require the server below.
+Northstar is a self-hosted IT inventory and help-desk web app for Ubuntu Server. It uses PostgreSQL for shared records, Samba AD DS over LDAPS or StartTLS for sign-in and directory sync, and Nginx as the HTTPS reverse proxy. The browser prototype still opens directly from `index.html`; production sign-in and shared data require the server below.
 
 ## Install on Ubuntu Server
 
 For a public GitHub repository, the release can be installed with one command from a fresh Ubuntu Server 22.04+ host (replace `OWNER/REPO` with the published repository):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/install-remote.sh | sudo bash -s -- OWNER/REPO main
+curl -fsSL -o /tmp/northstar-install-remote.sh https://raw.githubusercontent.com/OWNER/REPO/main/install-remote.sh && sudo bash /tmp/northstar-install-remote.sh OWNER/REPO main
 ```
 
-The launcher fetches the selected branch and runs the same interactive installer as a local checkout. The installer asks whether the FQDN has public DNS and ports 80/443 forwarded to this server; answer yes to let Caddy obtain a public ACME certificate, or no to use its private CA for an internal-only network. Public access also requires routing/firewall rules, a DNS record, a publicly reachable FQDN, and the Samba AD server reachable from Ubuntu. Do not expose the application database or scanner ports directly to the Internet. Private GitHub repositories need an authenticated checkout method; never put a GitHub token in a shared install command.
+The launcher fetches the selected branch and runs the same interactive installer as a local checkout. Nginx is configured with a self-signed certificate for the app FQDN and server IP. For public access, configure a trusted certificate and appropriate DNS, routing, and firewall rules separately. Do not expose the application database or scanner ports directly to the Internet. Private GitHub repositories need an authenticated checkout method; never put a GitHub token in a shared install command.
 
 1. Copy this project folder or its release archive to Ubuntu Server 22.04 or newer that can reach the Samba AD domain controller. Ensure the server has a static LAN IP.
 2. Add a Samba DNS A record for the chosen app FQDN, pointing to the Ubuntu server. Make the name available to the employee workstations.
@@ -23,7 +23,7 @@ The launcher fetches the selected branch and runs the same interactive installer
    ```
 
 6. Enter the app FQDN, Samba DNS/DC address, secure LDAP endpoint, base DN, UPN suffix, read-only service account and admin group DN. The account password is prompted without echo. For an internal AD certificate authority, provide its CA certificate PEM so the app can verify the DC certificate.
-7. After installation, distribute `/opt/northstar-it/caddy-root.crt` to managed workstations and trust it as a root CA. On Windows, distribute it through Group Policy to **Local Computer → Trusted Root Certification Authorities**. This is required because the installer configures Caddy's private internal CA.
+7. After installation, distribute `/opt/northstar-it/secrets/nginx.crt` to managed workstations and trust it on those devices to remove the browser certificate warning. On Windows, distribute it through Group Policy to **Local Computer → Trusted Root Certification Authorities**.
 8. Open `https://<app-fqdn>` (append a non-default HTTPS port if chosen). Sign in with a Samba AD username and password. The user's name, department and factory come from AD.
 
 ## Additional AD / LDAP directories
@@ -74,7 +74,7 @@ sudo systemctl list-timers 'northstar-backup*'
 sudo /opt/northstar-it/backup.sh manual
 ```
 
-Ports 80/443 are published by Caddy; PostgreSQL and Gunicorn are not directly exposed to the LAN. Gunicorn is bound to a loopback-only host port for the scanner companion. If another service already uses these ports, choose other ports in the installer. `compose.yaml` and the systemd timer/service files can be updated and reapplied after installation.
+Ports 80/443 (or the custom ports selected during installation) are published by Nginx; PostgreSQL and Gunicorn are not directly exposed to the LAN. Gunicorn is bound to a loopback-only host port for the scanner companion. If another service already uses these ports, choose other ports in the installer. `compose.yaml` and the systemd timer/service files can be updated and reapplied after installation. For this deployment the installer creates a self-signed certificate; browsers will show a trust warning until the certificate is installed on client devices. The app FQDN must also resolve to the Ubuntu server from each client; changing the reverse proxy does not configure DNS.
 
 ## Current scope
 

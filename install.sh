@@ -35,8 +35,6 @@ LDAP_SITE_ATTRIBUTE="${LDAP_SITE_ATTRIBUTE:-physicalDeliveryOfficeName}"
 read -r -p "Path to AD CA certificate PEM (Enter if trusted by system): " LDAP_CA_SOURCE
 read -r -p "HTTPS port (default 443): " HTTPS_PORT
 HTTPS_PORT="${HTTPS_PORT:-443}"
-read -r -p "Public DNS domain with ports 80/443 forwarded here? Use Let's Encrypt certificate? [y/N]: " PUBLIC_TLS
-if [[ "${PUBLIC_TLS,,}" == y || "${PUBLIC_TLS,,}" == yes ]]; then CADDY_TLS_DIRECTIVE=""; else CADDY_TLS_DIRECTIVE="tls internal"; fi
 read -r -p "HTTP redirect port (default 80): " HTTP_PORT
 HTTP_PORT="${HTTP_PORT:-80}"
 [[ -n "$APP_FQDN" && -n "$LDAP_DNS_SERVER" && -n "$LDAP_BASE_DN" && -n "$LDAP_BIND_USER" && -n "$AD_ADMIN_GROUP_DNS" ]] || { echo "FQDN, AD DNS, base DN, service account and admin group are required." >&2; exit 2; }
@@ -47,10 +45,10 @@ DB_PASSWORD="$(openssl rand -hex 32)"
 APP_SECRET="$(openssl rand -hex 48)"
 LDAP_BIND_PASSWORD_B64="$(printf '%s' "$LDAP_BIND_PASSWORD" | base64 -w0)"
 unset LDAP_BIND_PASSWORD
-export APP_FQDN LDAP_DNS_SERVER LDAP_URL LDAP_BASE_DN LDAP_UPN_SUFFIX LDAP_BIND_USER LDAP_BIND_PASSWORD_B64 AD_ADMIN_GROUP_DNS LDAP_SITE_ATTRIBUTE DB_PASSWORD APP_SECRET HTTP_PORT HTTPS_PORT CADDY_TLS_DIRECTIVE
+export APP_FQDN LDAP_DNS_SERVER LDAP_URL LDAP_BASE_DN LDAP_UPN_SUFFIX LDAP_BIND_USER LDAP_BIND_PASSWORD_B64 AD_ADMIN_GROUP_DNS LDAP_SITE_ATTRIBUTE DB_PASSWORD APP_SECRET HTTP_PORT HTTPS_PORT
 python3 - "$INSTALL_DIR/.env" <<'PY'
 import os, sys
-keys = ("APP_FQDN", "LDAP_DNS_SERVER", "LDAP_URL", "LDAP_BASE_DN", "LDAP_UPN_SUFFIX", "LDAP_BIND_USER", "LDAP_BIND_PASSWORD_B64", "AD_ADMIN_GROUP_DNS", "LDAP_SITE_ATTRIBUTE", "DB_PASSWORD", "APP_SECRET", "HTTP_PORT", "HTTPS_PORT", "CADDY_TLS_DIRECTIVE")
+keys = ("APP_FQDN", "LDAP_DNS_SERVER", "LDAP_URL", "LDAP_BASE_DN", "LDAP_UPN_SUFFIX", "LDAP_BIND_USER", "LDAP_BIND_PASSWORD_B64", "AD_ADMIN_GROUP_DNS", "LDAP_SITE_ATTRIBUTE", "DB_PASSWORD", "APP_SECRET", "HTTP_PORT", "HTTPS_PORT")
 def q(value):
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 with open(sys.argv[1], "w", encoding="utf-8") as f:
@@ -61,25 +59,28 @@ PY
 chmod 600 "$INSTALL_DIR/.env"
 chown -R 10001:10001 "$INSTALL_DIR/uploads" "$INSTALL_DIR/backups"
 chmod 700 "$INSTALL_DIR/uploads" "$INSTALL_DIR/backups" "$INSTALL_DIR/secrets"
+SERVER_IP="$(hostname -I | awk '{print $1}')"
+openssl req -x509 -nodes -days 825 -newkey rsa:2048 \
+  -keyout "$INSTALL_DIR/secrets/nginx.key" -out "$INSTALL_DIR/secrets/nginx.crt" \
+  -subj "/CN=$APP_FQDN" \
+  -addext "subjectAltName=DNS:$APP_FQDN,IP:$SERVER_IP" \
+  -addext "basicConstraints=critical,CA:TRUE"
+chmod 600 "$INSTALL_DIR/secrets/nginx.key"
+chmod 644 "$INSTALL_DIR/secrets/nginx.crt"
 chmod +x "$INSTALL_DIR/backup.sh" "$INSTALL_DIR/restore.sh"
 cd "$INSTALL_DIR"
 docker compose build app scanner
 docker compose up -d
-for attempt in $(seq 1 20); do
-  if docker compose cp web:/data/caddy/pki/authorities/local/root.crt "$INSTALL_DIR/caddy-root.crt" >/dev/null 2>&1; then chmod 644 "$INSTALL_DIR/caddy-root.crt"; break; fi
-  sleep 2
-done
 install -m 0644 "$INSTALL_DIR/systemd/northstar-backup@.service" /etc/systemd/system/northstar-backup@.service
 for kind in daily weekly monthly; do install -m 0644 "$INSTALL_DIR/systemd/northstar-backup-$kind.timer" "/etc/systemd/system/northstar-backup-$kind.timer"; done
 systemctl daemon-reload
 systemctl enable --now northstar-backup-daily.timer northstar-backup-weekly.timer northstar-backup-monthly.timer
-SERVER_IP="$(hostname -I | awk '{print $1}')"
 echo
 echo "Northstar is starting. Add this DNS A record: $APP_FQDN -> $SERVER_IP"
 echo "Open: https://$APP_FQDN:$HTTPS_PORT"
 echo "First local administrator (fresh database only): administrator1 / Admin@123 — change this starter password in Settings after signing in."
 echo "Backups: daily 01:30, weekly Sunday 02:30, monthly on day 1 at 03:30 (server local time)."
-echo "Caddy root CA is available after startup at: $INSTALL_DIR/caddy-root.crt"
+echo "Nginx TLS certificate: $INSTALL_DIR/secrets/nginx.crt (trust this certificate on managed workstations to remove browser warnings)."
 echo "Manual backup: sudo $INSTALL_DIR/backup.sh manual"
 echo "Restore: sudo $INSTALL_DIR/restore.sh /opt/northstar-it/backups/<backup-file>"
 echo "Check startup: cd $INSTALL_DIR && docker compose ps && docker compose logs -f app"
