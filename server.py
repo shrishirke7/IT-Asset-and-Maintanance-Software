@@ -426,14 +426,20 @@ def scanner_ip_status_task():
         inventory = (conn.execute("SELECT value FROM app_state WHERE key='assets'").fetchone() or ([],))[0]
         users = (conn.execute("SELECT value FROM app_state WHERE key='manual_users'").fetchone() or ([],))[0]
         targets = set()
-        for item, fields in [(a, ("ipAddress", "ip_address")) for a in inventory] + [(u, ("ip_address", "ipAddress")) for u in users]:
-            raw_ip = next((item.get(key) for key in fields if item.get(key)), "")
-            try:
-                ip = ipaddress.ip_address(str(raw_ip).strip())
-            except ValueError:
-                continue
-            if ip.version == 4 and ip.is_private and any(ip in network for network in networks):
-                targets.add(str(ip))
+        for item, fields, is_asset in ([(a, ("ipAddress", "ip_address"), True) for a in inventory]
+                                       + [(u, ("ip_address", "ipAddress"), False) for u in users]):
+            raw_values = [item.get(key) for key in fields if item.get(key)]
+            if is_asset and isinstance(item.get("networkInterfaces"), list):
+                for interface in item["networkInterfaces"]:
+                    if isinstance(interface, dict):
+                        raw_values.extend(interface.get(key) for key in ("ipAddress", "ip_address", "ip") if interface.get(key))
+            for raw_ip in raw_values:
+                try:
+                    ip = ipaddress.ip_address(str(raw_ip).strip())
+                except ValueError:
+                    continue
+                if ip.version == 4 and ip.is_private and any(ip in network for network in networks):
+                    targets.add(str(ip))
         if not targets:
             return ("", 204)
         task_id = str(uuid.uuid4())
@@ -482,12 +488,30 @@ def scanner_ip_status_results():
         users = users_row[0] if users_row else []
         assets_changed = users_changed = False
         for asset in inventory:
-            raw_ip = str(asset.get("ipAddress", asset.get("ip_address", ""))).strip()
-            if raw_ip not in target_set:
+            interfaces = asset.get("networkInterfaces")
+            if not isinstance(interfaces, list):
+                interfaces = []
+            checked_ips = set()
+            for interface in interfaces:
+                if not isinstance(interface, dict):
+                    continue
+                raw_ip = str(interface.get("ipAddress", interface.get("ip_address", interface.get("ip", "")))).strip()
+                if raw_ip not in target_set:
+                    continue
+                interface["ipStatus"] = interface["status"] = "Online" if raw_ip in responsive else "Offline"
+                interface["ipCheckedAt"] = checked_at
+                checked_ips.add(raw_ip)
+                if raw_ip in responsive:
+                    interface["lastSeen"] = checked_at
+            primary_ip = str(asset.get("ipAddress", asset.get("ip_address", ""))).strip()
+            if primary_ip in target_set:
+                checked_ips.add(primary_ip)
+            if not checked_ips:
                 continue
-            asset["status"] = asset["ipStatus"] = "Online" if raw_ip in responsive else "Offline"
+            is_online = bool(checked_ips & responsive)
+            asset["status"] = asset["ipStatus"] = "Online" if is_online else "Offline"
             asset["ipCheckedAt"] = checked_at
-            if raw_ip in responsive:
+            if is_online:
                 asset["lastSeen"] = checked_at
             assets_changed = True
         for user in users:
@@ -989,9 +1013,48 @@ def save_data():
                     for item in value:
                         asset = dict(item)
                         prior = prior_by_tag.get(str(asset.get("tag", "")).casefold(), {})
+                        interfaces = asset.get("networkInterfaces", [])
+                        if not isinstance(interfaces, list) or len(interfaces) > 16:
+                            return jsonify(error="Each asset can have up to 16 network interfaces."), 400
+                        prior_interfaces = prior.get("networkInterfaces", [])
+                        if not isinstance(prior_interfaces, list):
+                            prior_interfaces = []
+                        prior_by_interface = {}
+                        for previous in prior_interfaces:
+                            if isinstance(previous, dict):
+                                identity = (str(previous.get("name", previous.get("interface", ""))).strip().casefold(),
+                                            str(previous.get("ipAddress", previous.get("ip_address", previous.get("ip", "")))).strip())
+                                prior_by_interface[identity] = previous
+                        clean_interfaces = []
+                        for interface in interfaces:
+                            if not isinstance(interface, dict):
+                                return jsonify(error="Network interface entries must be objects."), 400
+                            name = str(interface.get("name", interface.get("interface", ""))).strip()[:80]
+                            ip_value = str(interface.get("ipAddress", interface.get("ip_address", interface.get("ip", "")))).strip()
+                            mac = str(interface.get("macAddress", interface.get("mac_address", ""))).strip()[:64]
+                            if len(ip_value) > 45:
+                                return jsonify(error="Network interface IP addresses are too long."), 400
+                            if ip_value:
+                                try:
+                                    ipaddress.ip_address(ip_value)
+                                except ValueError:
+                                    return jsonify(error="Enter a valid IP address for each network interface."), 400
+                            entry = {"name": name, "ipAddress": ip_value, "macAddress": mac}
+                            previous = prior_by_interface.get((name.casefold(), ip_value))
+                            if previous:
+                                for field in ("status", "ipStatus", "ipCheckedAt", "lastSeen"):
+                                    if field in previous:
+                                        entry[field] = previous[field]
+                            clean_interfaces.append(entry)
+                        asset["networkInterfaces"] = clean_interfaces
                         old_ip = str(prior.get("ipAddress", prior.get("ip_address", ""))).strip()
                         new_ip = str(asset.get("ipAddress", asset.get("ip_address", ""))).strip()
-                        if prior and old_ip == new_ip:
+                        old_ips = {old_ip} if old_ip else set()
+                        new_ips = {new_ip} if new_ip else set()
+                        old_ips.update(str(i.get("ipAddress", i.get("ip_address", i.get("ip", "")))).strip() for i in prior_interfaces if isinstance(i, dict))
+                        new_ips.update(i["ipAddress"] for i in clean_interfaces if i["ipAddress"])
+                        old_ips.discard("")
+                        if prior and old_ips == new_ips:
                             for field in ("status", "ipStatus", "ipCheckedAt", "lastSeen"):
                                 if field in prior:
                                     asset[field] = prior[field]
