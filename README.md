@@ -51,7 +51,9 @@ Daily, weekly, and monthly systemd timers are enabled by the installer. Keep ano
 
 ## Scanner
 
-Network discovery is an optional on-premise scanner. An administrator can configure authorized private IPv4 CIDR ranges (up to `/24` each and 1,024 total addresses), start a scan, view IP/MAC/reverse-DNS/latency results, download CSV, and add discovered equipment to inventory. Discovery uses ARP for directly attached subnets and one ICMP echo per address; it does not log into devices or inspect ports/files. Routed or VLAN-separated networks may need a scanner host at that site.
+Network discovery is an optional on-premise scanner. In **Network monitoring → Live network discovery**, an administrator saves authorized private IPv4 CIDR ranges (up to `/24` each and 1,024 total addresses), then starts a scan. The scanner must show **Scanner connected**; “Not configured” means no ranges have been saved. On Ubuntu, `ip -4 -o addr show scope global` shows the server's address and prefix; use your network administrator's approved subnet in CIDR form rather than guessing a range. Discovery uses ARP for directly attached subnets and one ICMP echo per address; it does not log into devices or inspect ports/files. Routed or VLAN-separated networks may need a scanner host at that site.
+
+After ranges are saved, the scanner runs a background scan every 15 minutes. Assets with an IP inside a saved range are marked Online when they respond and Offline when they do not; assets outside the authorized ranges are left unchanged. Asset tags are generated as `SS-<category>-<six digits>` for new assets (DP, LP, PR, NS, NR, SV, MO, TB, AP, or FW).
 
 ## Service commands
 

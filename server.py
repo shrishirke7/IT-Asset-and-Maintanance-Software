@@ -212,7 +212,8 @@ def get_login_branding():
     branding = settings.get("loginBranding", {})
     return jsonify({
         "companyName": str(branding.get("companyName") or settings.get("companyName") or "")[:120],
-        "tagline": str(branding.get("tagline") or "Elegance in every connection")[:180],
+        "tagline": str(branding.get("tagline") or "")[:180],
+        "showTagline": branding.get("showTagline", True) is not False,
         "logoUrl": str(branding.get("logoUrl") or "")[:300],
         "slides": branding.get("slides", [])[:5] if isinstance(branding.get("slides", []), list) else [],
         "slideInterval": max(3, min(30, int(branding.get("slideInterval", 6) or 6))),
@@ -254,7 +255,8 @@ def save_login_image(upload):
 def save_login_branding():
     try:
         company = str(request.form.get("companyName", "")).strip()[:120]
-        tagline = str(request.form.get("tagline", "Elegance in every connection")).strip()[:180] or "Elegance in every connection"
+        tagline = str(request.form.get("tagline", "")).strip()[:180]
+        show_tagline = str(request.form.get("showTagline", "true")).strip().lower() in ("true", "yes", "1")
         try:
             interval = max(3, min(30, int(request.form.get("slideInterval", "6"))))
             slides = json.loads(request.form.get("slides", "[]"))
@@ -274,8 +276,8 @@ def save_login_branding():
         for image in uploads:
             image_url = save_login_image(image)
             if image_url:
-                slides.append({"imageUrl": image_url, "caption": tagline})
-        branding.update(companyName=company, tagline=tagline, slides=slides, slideInterval=interval)
+                slides.append({"imageUrl": image_url, "caption": tagline if show_tagline else ""})
+        branding.update(companyName=company, tagline=tagline, showTagline=show_tagline, slides=slides, slideInterval=interval)
         current["companyName"] = company
         current["loginBranding"] = branding
         with db() as conn:
@@ -407,9 +409,19 @@ def scanner_task():
     with db() as conn:
         row = conn.execute("SELECT value FROM app_state WHERE key='network_scan' FOR UPDATE").fetchone()
         state = row[0] if row else {}
+        ranges = (conn.execute("SELECT value FROM app_state WHERE key='network_ranges'").fetchone() or ([],))[0]
+        if ranges and state.get("status") in (None, "", "idle", "completed", "failed"):
+            last_run = state.get("finished_at") or state.get("started_at") or ""
+            try:
+                due = not last_run or (datetime.now(timezone.utc) - datetime.fromisoformat(last_run)).total_seconds() >= 900
+            except (ValueError, TypeError):
+                due = True
+            if due:
+                hosts_count = sum(len(list(ipaddress.ip_network(value, strict=True).hosts())) for value in ranges)
+                state = {"id":str(uuid.uuid4()),"status":"queued","progress":0,"total":hosts_count,"results":[],"error":"","started_at":datetime.now(timezone.utc).isoformat(),"finished_at":""}
+                conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='network_scan'", (json.dumps(state),))
         if state.get("status") != "queued":
             return ("", 204)
-        ranges = (conn.execute("SELECT value FROM app_state WHERE key='network_ranges'").fetchone() or ([],))[0]
         state["status"] = "running"
         conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='network_scan'", (json.dumps(state),))
     return jsonify(id=state.get("id"), ranges=ranges, total=state.get("total", 0))
@@ -454,6 +466,28 @@ def scanner_progress():
         if status in ("completed", "failed"):
             state["finished_at"] = datetime.now(timezone.utc).isoformat()
         conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='network_scan'", (json.dumps(state),))
+        if status == "completed":
+            ranges = (conn.execute("SELECT value FROM app_state WHERE key='network_ranges'").fetchone() or ([],))[0]
+            networks = [ipaddress.ip_network(value, strict=True) for value in ranges]
+            inventory_row = conn.execute("SELECT value FROM app_state WHERE key='assets' FOR UPDATE").fetchone()
+            inventory = inventory_row[0] if inventory_row else []
+            online_ips = {item["ip"] for item in clean}
+            checked_at = datetime.now(timezone.utc).isoformat()
+            changed = False
+            for asset in inventory:
+                try:
+                    ip = ipaddress.ip_address(str(asset.get("ipAddress", "")).strip())
+                except ValueError:
+                    continue
+                if ip.version != 4 or not any(ip in network for network in networks):
+                    continue
+                asset["status"] = "Online" if str(ip) in online_ips else "Offline"
+                asset["ipCheckedAt"] = checked_at
+                if str(ip) in online_ips:
+                    asset["lastSeen"] = checked_at
+                changed = True
+            if changed:
+                conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='assets'", (json.dumps(inventory),))
     return jsonify(ok=True)
 
 
