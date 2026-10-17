@@ -89,7 +89,7 @@ def init_db():
         for statement in schema.split(";"):
             if statement.strip():
                 conn.execute(statement)
-        conn.execute("INSERT INTO app_state(key,value) VALUES('assets','[]'),('software','[]'),('departments','[]'),('maintenance','[]'),('manual_users','[]'),('network_ranges','[]'),('network_scan','{}'),('scanner_heartbeat','{}'),('scanner_ip_status','{}'),('settings','{}') ON CONFLICT(key) DO NOTHING")
+        conn.execute("INSERT INTO app_state(key,value) VALUES('assets','[]'),('software','[]'),('departments','[]'),('maintenance','[]'),('manual_users','[]'),('network_ranges','[]'),('network_scan','{}'),('scanner_heartbeat','{}'),('scanner_ip_status','{}'),('settings','{}'),('notifications','{\"rules\":[],\"queue\":[]}') ON CONFLICT(key) DO NOTHING")
 
 
 def signed_in(fn):
@@ -403,6 +403,176 @@ def _scanner_authorized():
     return bool(supplied) and secrets.compare_digest(supplied, APP_SECRET)
 
 
+def _notification_channel_status():
+    return {
+        "email": bool(os.getenv("SMTP_HOST") and os.getenv("SMTP_FROM")),
+        "whatsapp": bool(os.getenv("WHATSAPP_ACCESS_TOKEN") and os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+                         and os.getenv("WHATSAPP_API_VERSION") and os.getenv("WHATSAPP_TEMPLATE_NAME")),
+    }
+
+
+def _queue_asset_status_notifications(conn, state, asset, previous, current, checked_at, users):
+    if previous not in ("Online", "Offline") or previous == current:
+        return
+    asset_tag = str(asset.get("tag", ""))
+    asset_type = str(asset.get("type", ""))
+    event = current
+    for rule in state.get("rules", []):
+        if not isinstance(rule, dict) or not rule.get("enabled", True) or event not in rule.get("events", []):
+            continue
+        if rule.get("scope") == "device":
+            if asset_tag not in rule.get("deviceTags", []):
+                continue
+        elif rule.get("category") != asset_type:
+            continue
+        recipient_names = {str(value).casefold() for value in rule.get("recipients", [])}
+        recipients = [user for user in users if str(user.get("username") or user.get("id") or "").casefold() in recipient_names]
+        for user in recipients:
+            for channel in ("email", "whatsapp"):
+                if not rule.get("channels", {}).get(channel):
+                    continue
+                destination = str(user.get("email", "") if channel == "email" else user.get("phone", user.get("phone_number", ""))).strip()
+                if not destination or (channel == "whatsapp" and not rule.get("whatsappOptInConfirmed")):
+                    continue
+                state.setdefault("queue", []).append({
+                    "id": str(uuid.uuid4()), "rule": str(rule.get("name", "Status alert"))[:100],
+                    "asset": str(asset.get("name", asset_tag))[:160], "tag": asset_tag[:100],
+                    "category": asset_type[:40], "factory": str(asset.get("site", ""))[:40],
+                    "ip": str(asset.get("ipAddress", asset.get("ip_address", "")))[:45],
+                    "status": current, "previous": previous, "checkedAt": checked_at,
+                    "channel": channel, "recipient": str(user.get("name") or user.get("username") or "")[:120],
+                    "destination": destination[:254], "state": "pending", "attempts": 0,
+                    "createdAt": checked_at, "nextAttemptAt": checked_at, "error": ""
+                })
+    state["queue"] = state.get("queue", [])[-500:]
+
+
+@app.get("/api/admin/notifications")
+@administrator
+def get_notification_rules():
+    with db() as conn:
+        row = conn.execute("SELECT value FROM app_state WHERE key='notifications'").fetchone()
+        state = row[0] if row else {"rules": [], "queue": []}
+        users_row = conn.execute("SELECT value FROM app_state WHERE key='manual_users'").fetchone()
+        users = users_row[0] if users_row else []
+        asset_row = conn.execute("SELECT value FROM app_state WHERE key='assets'").fetchone()
+        assets = asset_row[0] if asset_row else []
+    history = [{k: item.get(k) for k in ("id", "rule", "asset", "tag", "category", "status", "channel", "recipient", "state", "createdAt", "error")} for item in state.get("queue", [])[-100:]]
+    return jsonify(rules=state.get("rules", []), history=history, channels=_notification_channel_status(),
+                   users=[{"username": u.get("username") or u.get("id", ""), "name": u.get("name") or u.get("username") or u.get("id", ""), "email": u.get("email", ""), "phone": u.get("phone") or u.get("phone_number", "")} for u in users],
+                   assets=[{"tag": a.get("tag", ""), "name": a.get("name", ""), "type": a.get("type", ""), "site": a.get("site", "")} for a in assets])
+
+
+@app.put("/api/admin/notifications")
+@administrator
+def save_notification_rules():
+    body = request.get_json(force=True) or {}
+    rules = body.get("rules")
+    if not isinstance(rules, list) or len(rules) > 100:
+        return jsonify(error="Provide up to 100 notification rules."), 400
+    allowed_categories = {"Laptop", "Desktop", "Server", "Printer", "Network", "Mobile", "Tablet"}
+    clean = []
+    seen_ids = set()
+    with db() as conn:
+        user_rows = conn.execute("SELECT value FROM app_state WHERE key='manual_users'").fetchone()
+        configured_users = user_rows[0] if user_rows else []
+        user_map = {str(u.get("username") or u.get("id") or "").casefold(): u for u in configured_users}
+        valid_users = set(user_map)
+        asset_rows = conn.execute("SELECT value FROM app_state WHERE key='assets'").fetchone()
+        current_assets = asset_rows[0] if asset_rows else []
+        valid_tags = {str(a.get("tag", "")) for a in current_assets}
+        allowed_categories.update(str(a.get("type", "")) for a in current_assets if a.get("type"))
+        for item in rules:
+            if not isinstance(item, dict):
+                return jsonify(error="Each rule must be an object."), 400
+            rule_id = str(item.get("id") or uuid.uuid4())[:80]
+            name = str(item.get("name", "")).strip()[:100]
+            scope = item.get("scope")
+            category = str(item.get("category", ""))
+            tags = list(dict.fromkeys(str(x) for x in item.get("deviceTags", []) if str(x) in valid_tags))[:100]
+            events = [x for x in (item.get("events") if isinstance(item.get("events"), list) else []) if x in ("Online", "Offline")]
+            recipients = list(dict.fromkeys(str(x) for x in (item.get("recipients") if isinstance(item.get("recipients"), list) else []) if str(x).casefold() in valid_users))[:100]
+            channels = item.get("channels") if isinstance(item.get("channels"), dict) else {}
+            if not name or scope not in ("category", "device") or (scope == "category" and category not in allowed_categories) or (scope == "device" and not tags) or not events or not recipients or not (channels.get("email") or channels.get("whatsapp")):
+                return jsonify(error="Every rule needs a name, scope, event, recipient and delivery channel."), 400
+            selected_users = [user_map[username.casefold()] for username in recipients]
+            if channels.get("email") and any(not str(user.get("email", "")).strip() for user in selected_users):
+                return jsonify(error="Every selected recipient needs an email address to use email alerts."), 400
+            if channels.get("whatsapp") and any(not 8 <= len(re.sub(r"\D", "", str(user.get("phone") or user.get("phone_number") or ""))) <= 15 for user in selected_users):
+                return jsonify(error="Every selected WhatsApp recipient needs a valid phone number with country code."), 400
+            if channels.get("whatsapp") and not item.get("whatsappOptInConfirmed"):
+                return jsonify(error="Confirm WhatsApp recipients have opted in before enabling WhatsApp alerts."), 400
+            if rule_id in seen_ids:
+                return jsonify(error="Rule IDs must be unique."), 400
+            seen_ids.add(rule_id)
+            clean.append({"id": rule_id, "name": name, "enabled": bool(item.get("enabled", True)), "scope": scope,
+                          "category": category if scope == "category" else "", "deviceTags": tags if scope == "device" else [],
+                          "events": list(dict.fromkeys(events)), "recipients": recipients,
+                          "channels": {"email": bool(channels.get("email")), "whatsapp": bool(channels.get("whatsapp"))},
+                          "whatsappOptInConfirmed": bool(item.get("whatsappOptInConfirmed"))})
+        current = conn.execute("SELECT value FROM app_state WHERE key='notifications' FOR UPDATE").fetchone()
+        state = current[0] if current else {"rules": [], "queue": []}
+        state["rules"] = clean
+        conn.execute("INSERT INTO app_state(key,value) VALUES('notifications',%s::jsonb) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=now()", (json.dumps(state),))
+    return jsonify(ok=True, rules=clean)
+
+
+@app.get("/api/internal/notification-task")
+def notification_task():
+    if not _scanner_authorized():
+        abort(403)
+    now = datetime.now(timezone.utc)
+    with db() as conn:
+        row = conn.execute("SELECT value FROM app_state WHERE key='notifications' FOR UPDATE").fetchone()
+        state = row[0] if row else {"rules": [], "queue": []}
+        channels = _notification_channel_status()
+        for job in state.get("queue", []):
+            if job.get("state") == "sending":
+                try:
+                    stale = (now - datetime.fromisoformat(job.get("claimedAt", ""))).total_seconds() > 180
+                except (ValueError, TypeError):
+                    stale = True
+                if stale:
+                    job["state"] = "pending"
+            if job.get("state") != "pending" or not channels.get(job.get("channel")):
+                continue
+            try:
+                due = datetime.fromisoformat(job.get("nextAttemptAt", "")) <= now
+            except (ValueError, TypeError):
+                due = True
+            if due:
+                job["state"] = "sending"
+                job["claimedAt"] = now.isoformat()
+                job["attempts"] = int(job.get("attempts", 0)) + 1
+                conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='notifications'", (json.dumps(state),))
+                return jsonify(job={k: job.get(k) for k in ("id", "asset", "tag", "category", "factory", "ip", "status", "previous", "checkedAt", "channel", "destination", "attempts")})
+        return ("", 204)
+
+
+@app.post("/api/internal/notification-result")
+def notification_result():
+    if not _scanner_authorized():
+        abort(403)
+    body = request.get_json(force=True) or {}
+    job_id = str(body.get("id", ""))
+    ok = bool(body.get("ok"))
+    error = str(body.get("error", ""))[:300]
+    now = datetime.now(timezone.utc)
+    with db() as conn:
+        row = conn.execute("SELECT value FROM app_state WHERE key='notifications' FOR UPDATE").fetchone()
+        state = row[0] if row else {"rules": [], "queue": []}
+        job = next((item for item in state.get("queue", []) if item.get("id") == job_id), None)
+        if not job:
+            return jsonify(error="Notification job not found"), 404
+        job["state"] = "sent" if ok else ("pending" if int(job.get("attempts", 0)) < 3 else "failed")
+        job["error"] = "" if ok else error
+        if not ok and job["state"] == "pending":
+            job["nextAttemptAt"] = (now + __import__("datetime").timedelta(seconds=30 * int(job.get("attempts", 1)))).isoformat()
+        job["completedAt"] = now.isoformat() if ok or job["state"] == "failed" else ""
+        conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='notifications'", (json.dumps(state),))
+    return jsonify(ok=True)
+
+
 @app.get("/api/internal/ip-status-task")
 def scanner_ip_status_task():
     if not _scanner_authorized():
@@ -486,6 +656,9 @@ def scanner_ip_status_results():
         inventory = inventory_row[0] if inventory_row else []
         users_row = conn.execute("SELECT value FROM app_state WHERE key='manual_users' FOR UPDATE").fetchone()
         users = users_row[0] if users_row else []
+        notifications_row = conn.execute("SELECT value FROM app_state WHERE key='notifications' FOR UPDATE").fetchone()
+        notifications = notifications_row[0] if notifications_row else {"rules": [], "queue": []}
+        queue_size_before = len(notifications.get("queue", []))
         assets_changed = users_changed = False
         for asset in inventory:
             interfaces = asset.get("networkInterfaces")
@@ -508,11 +681,13 @@ def scanner_ip_status_results():
                 checked_ips.add(primary_ip)
             if not checked_ips:
                 continue
+            previous_status = str(asset.get("ipStatus", asset.get("status", "")))
             is_online = bool(checked_ips & responsive)
             asset["status"] = asset["ipStatus"] = "Online" if is_online else "Offline"
             asset["ipCheckedAt"] = checked_at
             if is_online:
                 asset["lastSeen"] = checked_at
+            _queue_asset_status_notifications(conn, notifications, asset, previous_status, asset["status"], checked_at, users)
             assets_changed = True
         for user in users:
             raw_ip = str(user.get("ip_address", user.get("ipAddress", ""))).strip()
@@ -530,6 +705,8 @@ def scanner_ip_status_results():
         state["finished_at"] = checked_at
         state["online_count"] = len(responsive)
         conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='scanner_ip_status'", (json.dumps(state),))
+        if len(notifications.get("queue", [])) != queue_size_before:
+            conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='notifications'", (json.dumps(notifications),))
     return jsonify(ok=True, online=len(responsive), checked=len(target_set))
 
 

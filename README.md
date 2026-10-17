@@ -41,7 +41,9 @@ Manual backup:
 sudo /opt/northstar-it/backup.sh manual
 ```
 
-Restore a backup archive:
+To move data to another server, create a manual backup on the current server and download its `.tar.gz` file from **Backup & restore → Backup files**. On the destination server, sign in as an administrator, open **Backup & restore**, upload the Northstar archive, and confirm by typing `RESTORE`. The app verifies the archive, creates a safety backup of the destination, then restores the database and uploaded attachments. The upload limit is 1 GB.
+
+The restore replaces destination application records and attachments. It does not migrate `.env`, HTTPS certificates, or operating-system settings; keep the destination server's own configuration. For command-line recovery, the protected restore script remains available:
 
 ```bash
 sudo /opt/northstar-it/restore.sh /opt/northstar-it/backups/<backup-file>
@@ -54,6 +56,12 @@ Daily, weekly, and monthly systemd timers are enabled by the installer. Keep ano
 Network discovery is an optional on-premise scanner. In **Network monitoring → Live network discovery**, an administrator saves authorized private IPv4 CIDR ranges (up to `/24` each and 1,024 total addresses), then starts a scan. The scanner must show **Scanner connected**; “Not configured” means no ranges have been saved. On Ubuntu, `ip -4 -o addr show scope global` shows the server's address and prefix; use your network administrator's approved subnet in CIDR form rather than guessing a range. Discovery uses ARP for directly attached subnets and one ICMP echo per address; it does not log into devices or inspect ports/files. Routed or VLAN-separated networks may need a scanner host at that site.
 
 After ranges are saved, a subnet discovery scan runs every 15 minutes and known asset/employee IPs are pinged in the background about every 30 seconds. They are marked Online when they reply to ICMP ping and Offline when they do not; records outside the authorized ranges remain Not checked. A device that blocks ICMP can appear Offline. Status timestamps are shown in the inventory and user list. Asset tags are generated as `SS-<category>-<six digits>` for new assets (DP, LP, PR, NS, NR, SV, MO, TB, AP, or FW).
+
+## Notifications
+
+Administrators can create alert rules in **Notifications** for one asset category or selected devices, choose Online/Offline status transitions, select recipient accounts, and choose email and/or WhatsApp. Alerts are queued when a known asset changes status; the scanner checks known device IPs about every 30 seconds. Initial `Not checked` status does not trigger an alert. Recipients need an email address or phone number in their account profile. WhatsApp recipients must have opted in.
+
+Email delivery is optional. Add `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`, and `SMTP_STARTTLS` to the private `/opt/northstar-it/.env` file. WhatsApp delivery uses Meta's WhatsApp Business Cloud API. Configure `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_API_VERSION`, `WHATSAPP_TEMPLATE_NAME`, and `WHATSAPP_TEMPLATE_LANGUAGE` in that same private file. The approved message template must have four body parameters in this order: device name, asset tag, current status, and IP address. After adding provider settings, run `sudo docker compose up -d --force-recreate scanner` from `/opt/northstar-it`. Never commit provider secrets to Git.
 
 ## Service commands
 

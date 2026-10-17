@@ -1,11 +1,14 @@
 """Host-network scanner companion for the Northstar on-premise application."""
 import concurrent.futures
 import datetime
+from email.message import EmailMessage
 import ipaddress
 import json
 import os
 import platform
 import re
+import smtplib
+import ssl
 import socket
 import subprocess
 import time
@@ -141,6 +144,95 @@ def run_ip_status_task(task):
         print(f"IP status check failed: {type(exc).__name__}", flush=True)
 
 
+def send_notification(job):
+    channel = job.get("channel")
+    status = str(job.get("status", ""))
+    asset = str(job.get("asset", "Managed device"))
+    tag = str(job.get("tag", ""))
+    ip = str(job.get("ip", "Not recorded")) or "Not recorded"
+    factory = str(job.get("factory", "Not recorded")) or "Not recorded"
+    if channel == "email":
+        host = os.getenv("SMTP_HOST", "").strip()
+        sender = os.getenv("SMTP_FROM", "").strip()
+        if not host or not sender:
+            raise RuntimeError("Email SMTP settings are missing")
+        message = EmailMessage()
+        message["Subject"] = f"IT asset {status.lower()}: {asset} ({tag})"
+        message["From"] = sender
+        message["To"] = str(job.get("destination", ""))
+        message.set_content(
+            f"IT asset status changed.\n\nDevice: {asset}\nAsset tag: {tag}\n"
+            f"Category: {job.get('category', '')}\nStatus: {job.get('previous', '')} → {status}\n"
+            f"IP address: {ip}\nFactory: {factory}\nChecked at: {job.get('checkedAt', '')}\n"
+        )
+        port = int(os.getenv("SMTP_PORT", "587"))
+        timeout = 15
+        username = os.getenv("SMTP_USERNAME", "")
+        password = os.getenv("SMTP_PASSWORD", "")
+        if os.getenv("SMTP_SSL", "false").lower() == "true":
+            with smtplib.SMTP_SSL(host, port, timeout=timeout, context=ssl.create_default_context()) as smtp:
+                if username:
+                    smtp.login(username, password)
+                smtp.send_message(message)
+        else:
+            with smtplib.SMTP(host, port, timeout=timeout) as smtp:
+                smtp.ehlo()
+                if os.getenv("SMTP_STARTTLS", "true").lower() == "true":
+                    smtp.starttls(context=ssl.create_default_context())
+                    smtp.ehlo()
+                if username:
+                    smtp.login(username, password)
+                smtp.send_message(message)
+        return
+    if channel == "whatsapp":
+        token = os.getenv("WHATSAPP_ACCESS_TOKEN", "").strip()
+        phone_number_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
+        version = os.getenv("WHATSAPP_API_VERSION", "").strip()
+        template_name = os.getenv("WHATSAPP_TEMPLATE_NAME", "").strip()
+        language = os.getenv("WHATSAPP_TEMPLATE_LANGUAGE", "en_US").strip() or "en_US"
+        if not all((token, phone_number_id, version, template_name)):
+            raise RuntimeError("WhatsApp Cloud API settings are missing")
+        recipient = re.sub(r"\D", "", str(job.get("destination", "")))
+        if not recipient or len(recipient) < 8:
+            raise RuntimeError("Recipient WhatsApp number must include country code")
+        payload = {
+            "messaging_product": "whatsapp", "to": recipient, "type": "template",
+            "template": {"name": template_name, "language": {"code": language}, "components": [{
+                "type": "body", "parameters": [
+                    {"type": "text", "text": asset[:160]},
+                    {"type": "text", "text": tag[:100]},
+                    {"type": "text", "text": status[:20]},
+                    {"type": "text", "text": ip[:45]},
+                ]
+            }]}
+        }
+        request = urllib.request.Request(
+            f"https://graph.facebook.com/{version}/{phone_number_id}/messages",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=15) as response:
+            result = json.loads(response.read() or b"{}")
+            if response.status < 200 or response.status >= 300 or not result.get("messages"):
+                raise RuntimeError("WhatsApp API did not accept the template message")
+        return
+    raise RuntimeError("Unsupported notification channel")
+
+
+def run_notification_task(task):
+    job = task.get("job") or {}
+    if not job:
+        return
+    ok, error = True, ""
+    try:
+        send_notification(job)
+    except Exception as exc:
+        ok, error = False, type(exc).__name__
+    request_json("/api/internal/notification-result", {"id": job.get("id", ""), "ok": ok, "error": error}, timeout=10)
+    print(f"Notification {job.get('channel', '')} {'sent' if ok else 'failed'} ({error or 'accepted'})", flush=True)
+
+
 def main():
     if len(TOKEN) < 40:
         raise SystemExit("APP_SECRET must be configured before the scanner agent starts")
@@ -151,6 +243,9 @@ def main():
             if time.monotonic() - last_heartbeat >= 6:
                 request_json("/api/internal/scanner-heartbeat", payload={}, timeout=5)
                 last_heartbeat = time.monotonic()
+            notification = request_json("/api/internal/notification-task", timeout=5)
+            if notification:
+                run_notification_task(notification)
             task = request_json("/api/internal/scanner-task", timeout=5)
             if task:
                 print(f"Starting authorized scan {task['id']} over {task.get('total', 0)} addresses", flush=True)
