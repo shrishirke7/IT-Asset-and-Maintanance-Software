@@ -108,15 +108,6 @@ def run_task(task):
                 row = future.result()
                 if row and scanned_ip in arp_hosts:
                     row["mac"] = arp_hosts[scanned_ip]["mac"]
-                elif not row and scanned_ip in arp_hosts:
-                    arp_row = arp_hosts[scanned_ip]
-                    hostname = arp_row["hostname"]
-                    if not hostname:
-                        try:
-                            hostname = socket.gethostbyaddr(scanned_ip)[0]
-                        except (OSError, socket.herror):
-                            hostname = ""
-                    row = {"ip":scanned_ip, "mac":arp_row["mac"], "hostname":hostname, "status":"Online", "latency_ms":None, "last_seen":datetime.datetime.now(datetime.timezone.utc).isoformat()}
                 if row:
                     results.append(row)
                 progress += 1

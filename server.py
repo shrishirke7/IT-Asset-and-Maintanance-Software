@@ -471,23 +471,41 @@ def scanner_progress():
             networks = [ipaddress.ip_network(value, strict=True) for value in ranges]
             inventory_row = conn.execute("SELECT value FROM app_state WHERE key='assets' FOR UPDATE").fetchone()
             inventory = inventory_row[0] if inventory_row else []
+            users_row = conn.execute("SELECT value FROM app_state WHERE key='manual_users' FOR UPDATE").fetchone()
+            users = users_row[0] if users_row else []
             online_ips = {item["ip"] for item in clean}
             checked_at = datetime.now(timezone.utc).isoformat()
-            changed = False
+            assets_changed = False
+            users_changed = False
             for asset in inventory:
                 try:
-                    ip = ipaddress.ip_address(str(asset.get("ipAddress", "")).strip())
+                    ip = ipaddress.ip_address(str(asset.get("ipAddress", asset.get("ip_address", ""))).strip())
                 except ValueError:
                     continue
                 if ip.version != 4 or not any(ip in network for network in networks):
                     continue
                 asset["status"] = "Online" if str(ip) in online_ips else "Offline"
+                asset["ipStatus"] = asset["status"]
                 asset["ipCheckedAt"] = checked_at
                 if str(ip) in online_ips:
                     asset["lastSeen"] = checked_at
-                changed = True
-            if changed:
+                assets_changed = True
+            for user in users:
+                try:
+                    ip = ipaddress.ip_address(str(user.get("ip_address", user.get("ipAddress", ""))).strip())
+                except ValueError:
+                    continue
+                if ip.version != 4 or not any(ip in network for network in networks):
+                    continue
+                user["ipStatus"] = "Online" if str(ip) in online_ips else "Offline"
+                user["ipCheckedAt"] = checked_at
+                if str(ip) in online_ips:
+                    user["lastSeen"] = checked_at
+                users_changed = True
+            if assets_changed:
                 conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='assets'", (json.dumps(inventory),))
+            if users_changed:
+                conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='manual_users'", (json.dumps(users),))
     return jsonify(ok=True)
 
 
@@ -847,6 +865,25 @@ def save_data():
         for key in ("assets", "software", "departments", "maintenance", "manual_users", "settings"):
             if key in body:
                 value = body[key]
+                if key == "assets" and isinstance(value, list):
+                    current = (conn.execute("SELECT value FROM app_state WHERE key='assets'").fetchone() or ([],))[0]
+                    prior_by_tag = {str(a.get("tag", "")).casefold(): a for a in current}
+                    reconciled = []
+                    for item in value:
+                        asset = dict(item)
+                        prior = prior_by_tag.get(str(asset.get("tag", "")).casefold(), {})
+                        old_ip = str(prior.get("ipAddress", prior.get("ip_address", ""))).strip()
+                        new_ip = str(asset.get("ipAddress", asset.get("ip_address", ""))).strip()
+                        if prior and old_ip == new_ip:
+                            for field in ("status", "ipStatus", "ipCheckedAt", "lastSeen"):
+                                if field in prior:
+                                    asset[field] = prior[field]
+                        else:
+                            asset["status"] = "Not checked"
+                            asset["ipStatus"] = "Not checked"
+                            asset["ipCheckedAt"] = ""
+                        reconciled.append(asset)
+                    value = reconciled
                 if key == "manual_users":
                     current = (conn.execute("SELECT value FROM app_state WHERE key='manual_users'").fetchone() or ([],))[0]
                     existing = {str(u.get("username", "")).casefold(): u for u in current}
@@ -859,6 +896,15 @@ def save_data():
                         if not re.fullmatch(r"[A-Za-z0-9._@-]{3,80}", username):
                             return jsonify(error="Usernames must be 3–80 letters, numbers, dots, underscores, @, or hyphens."), 400
                         prior = existing.get(username.casefold(), {})
+                        old_ip = str(prior.get("ip_address", prior.get("ipAddress", ""))).strip()
+                        new_ip = str(user.get("ip_address", user.get("ipAddress", ""))).strip()
+                        if prior and old_ip == new_ip:
+                            for field in ("ipStatus", "ipCheckedAt", "lastSeen"):
+                                if field in prior:
+                                    user[field] = prior[field]
+                        elif new_ip:
+                            user["ipStatus"] = "Not checked"
+                            user["ipCheckedAt"] = ""
                         new_password = user.pop("password", "")
                         user.pop("password_confirm", None)
                         if new_password:
