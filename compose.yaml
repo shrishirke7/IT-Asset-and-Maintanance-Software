@@ -38,10 +38,12 @@ services:
     build: .
     command: ["python", "scanner_agent.py"]
     restart: unless-stopped
+    user: "0:0"
     env_file: .env
     environment:
       SCANNER_URL: http://127.0.0.1:18000
     network_mode: host
+    cap_drop: [ALL]
     cap_add: [NET_RAW]
     depends_on: [app]
 
