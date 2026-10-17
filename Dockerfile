@@ -7,4 +7,4 @@ COPY server.py schema.sql index.html setup.html portal.html scanner_agent.py bac
 RUN mkdir -p /app/uploads && chown -R appuser:appuser /app
 USER appuser
 EXPOSE 8000
-CMD ["gunicorn", "--workers", "2", "--threads", "4", "--bind", "0.0.0.0:8000", "--access-logfile", "-", "--access-logformat", "%(h)s %(l)s %(u)s %(t)s \"%(m)s %(U)s %(H)s\" %(s)s %(b)s \"%(f)s\" \"%(a)s\"", "server:app"]
+CMD ["gunicorn", "--workers", "2", "--threads", "4", "--timeout", "3600", "--bind", "0.0.0.0:8000", "--access-logfile", "-", "--access-logformat", "%(h)s %(l)s %(u)s %(t)s \"%(m)s %(U)s %(H)s\" %(s)s %(b)s \"%(f)s\" \"%(a)s\"", "server:app"]

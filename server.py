@@ -9,6 +9,8 @@ import uuid
 import ipaddress
 import threading
 import unicodedata
+import shutil
+import tempfile
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
@@ -23,6 +25,8 @@ from werkzeug.security import check_password_hash, generate_password_hash
 ROOT = Path(__file__).resolve().parent
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", ROOT / "uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+BACKUP_DIR = Path(os.getenv("BACKUP_DIR", "/backups"))
+RESTORE_LOCK_PATH = Path("/tmp/northstar-restore-in-progress")
 LOGIN_MEDIA_DIR = UPLOAD_DIR / "login-branding"
 LOGIN_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 PROFILE_MEDIA_DIR = UPLOAD_DIR / 'profiles'
@@ -41,6 +45,13 @@ app.config.update(
     MAX_CONTENT_LENGTH=12 * 1024 * 1024,
     PERMANENT_SESSION_LIFETIME=60 * 60 * 8,
 )
+
+
+@app.before_request
+def pause_api_during_restore():
+    request.max_content_length = 1024 * 1024 * 1024 if request.path == "/api/backups/restore" else 12 * 1024 * 1024
+    if request.path.startswith("/api/") and RESTORE_LOCK_PATH.exists():
+        return jsonify(error="A backup restore is in progress. Please try again shortly."), 503
 DATABASE_URL = os.environ["DATABASE_URL"]
 RECOVERY_QUESTIONS = ("Favourite animal", "Favourite colour", "Favourite food")
 RECOVERY_GENERIC_MESSAGE = "If the account and answers match, the password was reset. Try signing in."
@@ -1185,9 +1196,93 @@ def create_manual_backup():
         return jsonify(error="Backup failed. Check server logs."), 500
 
 
+@app.post("/api/backups/restore")
+@administrator
+def restore_uploaded_backup():
+    upload = request.files.get("backup")
+    if not upload or not upload.filename:
+        return jsonify(error="Choose a Northstar .tar.gz backup file."), 400
+    if not upload.filename.lower().endswith((".tar.gz", ".tgz")):
+        return jsonify(error="Only Northstar .tar.gz backup files are supported."), 400
+
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="northstar-restore-") as temp_name:
+        temp = Path(temp_name)
+        archive = temp / "uploaded-backup.tar.gz"
+        extracted = temp / "validated"
+        upload.save(archive)
+
+        try:
+            validation = subprocess.run(
+                ["python", str(ROOT / "restore_archive.py"), str(archive), str(extracted)],
+                capture_output=True, text=True, check=True, timeout=1800,
+            )
+        except subprocess.CalledProcessError as exc:
+            app.logger.warning("Uploaded backup rejected: %s", (exc.stderr or exc.stdout)[-1000:])
+            return jsonify(error="Backup validation failed. Check that this is an intact Northstar backup."), 400
+        except subprocess.TimeoutExpired:
+            return jsonify(error="Backup validation took too long. No data was restored."), 504
+
+        try:
+            lock_fd = os.open(RESTORE_LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            return jsonify(error="Another restore is already in progress."), 409
+
+        safety_name = ""
+        try:
+            os.write(lock_fd, str(os.getpid()).encode("ascii"))
+            os.close(lock_fd)
+            safety = subprocess.run(
+                ["python", str(ROOT / "backup.py"), "manual"],
+                capture_output=True, text=True, check=True, timeout=1800,
+            )
+            safety_name = safety.stdout.strip()
+            db_dump = extracted / "database.dump"
+            subprocess.run(
+                ["pg_restore", "--clean", "--if-exists", "--no-owner", "--single-transaction",
+                 "--dbname", os.environ["DATABASE_URL"], str(db_dump)],
+                capture_output=True, text=True, check=True, timeout=1800,
+            )
+
+            restored_uploads = extracted / "uploads"
+            staging = UPLOAD_DIR.parent / (".uploads-restore-" + uuid.uuid4().hex)
+            previous = UPLOAD_DIR.parent / (".uploads-before-restore-" + uuid.uuid4().hex)
+            shutil.copytree(restored_uploads, staging)
+            moved_previous = False
+            try:
+                if UPLOAD_DIR.exists():
+                    os.replace(UPLOAD_DIR, previous)
+                    moved_previous = True
+                os.replace(staging, UPLOAD_DIR)
+            except Exception:
+                if moved_previous and previous.exists() and not UPLOAD_DIR.exists():
+                    os.replace(previous, UPLOAD_DIR)
+                raise
+            if previous.exists():
+                shutil.rmtree(previous)
+            init_db()
+            return jsonify(ok=True, safety_backup=safety_name,
+                           message="Backup restored. Sign in again if the restored user accounts differ.")
+        except subprocess.CalledProcessError as exc:
+            app.logger.error("Uploaded backup restore failed: %s", (exc.stderr or exc.stdout)[-2000:])
+            return jsonify(error="Restore failed. Check server logs; the pre-restore safety backup is " + (safety_name or "being created") + "."), 500
+        except subprocess.TimeoutExpired:
+            return jsonify(error="Restore took too long. Check server logs and the pre-restore safety backup."), 504
+        except Exception:
+            app.logger.exception("Uploaded backup restore failed unexpectedly")
+            return jsonify(error="Restore failed. Check server logs and the pre-restore safety backup."), 500
+        finally:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+            RESTORE_LOCK_PATH.unlink(missing_ok=True)
+
+
 @app.errorhandler(413)
 def too_large(_):
-    return jsonify(error="Request too large (maximum 12 MB)"), 413
+    limit = "1 GB" if request.path == "/api/backups/restore" else "12 MB"
+    return jsonify(error=f"Request too large (maximum {limit})"), 413
 
 
 init_db()
