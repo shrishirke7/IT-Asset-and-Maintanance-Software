@@ -18,7 +18,9 @@ The initial certificate is self-signed, so browsers show a certificate warning u
 
 ## Accounts
 
-The first-run browser wizard creates the first Administrator. After signing in, open **Settings → User accounts** to add regular User accounts and additional Administrators. Each account has its own username and password. Passwords are saved as salted hashes. Users can change their own password in Settings.
+The first-run browser wizard creates the first Administrator. After signing in, open **Settings → User accounts** to add regular User accounts and additional Administrators. Each account has its own username and password. Passwords and recovery answers are saved as salted hashes. Users can change their own password and set three recovery answers in Settings. Recovery answers are guessable personal facts, so choose private, hard-to-guess phrases; recovery attempts are rate-limited. Recovery questions are a convenience and are weaker than multi-factor authentication or a separately stored recovery code.
+
+For a server-side administrator password reset when recovery answers have not been configured, run `sudo docker exec -it northstar-it-app-1 python reset_admin_password.py` on the Ubuntu server. The script prompts without echoing the password and changes only the named enabled Administrator account.
 
 ## Update
 

@@ -40,3 +40,10 @@ CREATE TABLE IF NOT EXISTS login_attempts (
   failures integer NOT NULL DEFAULT 0,
   blocked_until timestamptz
 );
+CREATE TABLE IF NOT EXISTS recovery_attempts (
+  client_ip inet NOT NULL,
+  username_hash text NOT NULL,
+  failures integer NOT NULL DEFAULT 0,
+  blocked_until timestamptz,
+  PRIMARY KEY (client_ip, username_hash)
+);

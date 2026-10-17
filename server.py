@@ -3,10 +3,12 @@ import os
 import re
 import secrets
 import hashlib
+import hmac
 import subprocess
 import uuid
 import ipaddress
 import threading
+import unicodedata
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
@@ -40,10 +42,34 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=60 * 60 * 8,
 )
 DATABASE_URL = os.environ["DATABASE_URL"]
+RECOVERY_QUESTIONS = ("Favourite animal", "Favourite colour", "Favourite food")
+RECOVERY_GENERIC_MESSAGE = "If the account and answers match, the password was reset. Try signing in."
+RECOVERY_DUMMY_HASH = generate_password_hash("not-a-real-recovery-answer")
+LOGIN_DUMMY_HASH = generate_password_hash("not-a-real-login-password")
 
 
 def db():
     return psycopg.connect(DATABASE_URL, connect_timeout=8)
+
+
+def normalize_recovery_answer(value):
+    return " ".join(unicodedata.normalize("NFKC", str(value or "")).casefold().split())
+
+
+def recovery_answer_hashes(values):
+    if not isinstance(values, list) or len(values) != len(RECOVERY_QUESTIONS):
+        return None
+    answers = [normalize_recovery_answer(value) for value in values]
+    if any(len(answer) < 3 or len(answer) > 200 for answer in answers):
+        return None
+    return [generate_password_hash(answer) for answer in answers]
+
+
+def matches_recovery_answer(stored_hash, answer):
+    try:
+        return check_password_hash(stored_hash, answer)
+    except (ValueError, TypeError, AttributeError):
+        return False
 
 
 def init_db():
@@ -58,8 +84,22 @@ def init_db():
 def signed_in(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        if not session.get("profile"):
+        profile = session.get("profile")
+        if not profile:
             return jsonify(error="sign_in_required"), 401
+        username = str(profile.get("username", "")).casefold()
+        with db() as conn:
+            row = conn.execute("SELECT value FROM app_state WHERE key='manual_users'").fetchone()
+        users = row[0] if row else []
+        account = next((u for u in users if str(u.get("username", "")).casefold() == username), None)
+        try:
+            current_version = int(account.get("auth_version", 0)) if account else -1
+            session_version = int(session.get("auth_version", 0))
+        except (TypeError, ValueError):
+            current_version, session_version = -1, 0
+        if not account or not account.get("enabled", True) or current_version != session_version:
+            session.clear()
+            return jsonify(error="session_expired_sign_in_again"), 401
         return fn(*args, **kwargs)
     return wrapper
 
@@ -92,6 +132,16 @@ def check_api_origin():
             abort(403)
         if request.headers.get("X-Requested-With") != "NorthstarIT":
             abort(403)
+
+
+@app.after_request
+def add_security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    if request.path in ("/", "/setup", "/api/login", "/api/recovery/reset", "/api/account/recovery-answers"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/")
@@ -127,10 +177,13 @@ def initial_setup():
     full_name = str(body.get("full_name", "")).strip()[:120]
     username = str(body.get("username", "")).strip()[:80]
     password = str(body.get("password", ""))
+    answer_hashes = recovery_answer_hashes(body.get("recovery_answers"))
     if not full_name or not re.fullmatch(r"[A-Za-z0-9._@-]{3,80}", username):
         return jsonify(error="Enter the administrator name and a valid username (3–80 letters, numbers, dots, underscores, @, or hyphens)."), 400
     if len(password) < 10 or len(password) > 1024:
         return jsonify(error="Choose a password with at least 10 characters."), 400
+    if not answer_hashes:
+        return jsonify(error="Answer all three recovery questions (3–200 characters each)."), 400
     with db() as conn:
         conn.execute("SELECT pg_advisory_xact_lock(hashtext('northstar-first-setup'))")
         row = conn.execute("SELECT value FROM app_state WHERE key='manual_users' FOR UPDATE").fetchone()
@@ -139,7 +192,7 @@ def initial_setup():
             return jsonify(error="Setup is already complete. Sign in instead."), 409
         if any(str(u.get("username", "")).casefold() == username.casefold() for u in users):
             return jsonify(error="That username already exists."), 409
-        users.append({"id":username,"username":username,"name":full_name,"email":"","site":"","dept":"","role":"Administrator","enabled":True,"source":"manual","password_hash":generate_password_hash(password)})
+        users.append({"id":username,"username":username,"name":full_name,"email":"","site":"","dept":"","role":"Administrator","enabled":True,"source":"manual","password_hash":generate_password_hash(password),"auth_version":0,"recovery_answer_hashes":answer_hashes})
         conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='manual_users'", (json.dumps(users),))
         settings_row=conn.execute("SELECT value FROM app_state WHERE key='settings' FOR UPDATE").fetchone()
         settings=settings_row[0] if settings_row else {}
@@ -419,6 +472,7 @@ def login():
         local_state = conn.execute("SELECT value FROM app_state WHERE key='manual_users'").fetchone()
     local_users = local_state[0] if local_state else []
     local_user = next((u for u in local_users if str(u.get("username", "")).casefold() == username.casefold()), None)
+    password_hash = local_user.get("password_hash") if local_user and local_user.get("enabled", True) else LOGIN_DUMMY_HASH
     if local_user and local_user.get("enabled", True) and local_user.get("password_hash"):
         try:
             valid_local = check_password_hash(local_user["password_hash"], password)
@@ -430,12 +484,83 @@ def login():
                 conn.execute("DELETE FROM login_attempts WHERE client_ip=%s", (remote_ip,))
             session.clear()
             session.permanent = True
+            session["auth_version"] = int(local_user.get("auth_version", 0) or 0)
             session["is_admin"] = profile["role"] == "Administrator"
             session["profile"] = {key:value for key,value in profile.items() if key != "groups"}
             return jsonify(profile=session["profile"], isAdmin=session["is_admin"])
+    else:
+        try:
+            check_password_hash(password_hash, password)
+        except (ValueError, TypeError):
+            pass
     with db() as conn:
         conn.execute("INSERT INTO login_attempts(client_ip,failures,blocked_until) VALUES(%s,1,NULL) ON CONFLICT(client_ip) DO UPDATE SET failures=login_attempts.failures+1, blocked_until=CASE WHEN login_attempts.failures+1>=5 THEN now()+interval '15 minutes' ELSE NULL END", (remote_ip,))
     return jsonify(error="Sign-in failed. Check your username and password."), 401
+
+
+@app.post("/api/recovery/reset")
+def recover_account_password():
+    body = request.get_json(silent=True) or {}
+    username = str(body.get("username", "")).strip()[:120]
+    raw_answers = body.get("answers", [])
+    new_password = str(body.get("new_password", ""))
+    confirm_password = str(body.get("confirm_password", ""))
+    if not username or len(new_password) < 10 or len(new_password) > 1024 or new_password != confirm_password:
+        return jsonify(message=RECOVERY_GENERIC_MESSAGE), 200
+    normalized = [normalize_recovery_answer(a) for a in raw_answers] if isinstance(raw_answers, list) else []
+    if len(normalized) != len(RECOVERY_QUESTIONS) or any(len(a) < 3 or len(a) > 200 for a in normalized):
+        normalized = ["invalid-answer"] * len(RECOVERY_QUESTIONS)
+    remote_ip = request.remote_addr or "127.0.0.1"
+    username_key = hmac.new(APP_SECRET.encode(), username.casefold().encode(), hashlib.sha256).hexdigest()
+    with db() as conn:
+        attempt = conn.execute(
+            "SELECT failures,blocked_until FROM recovery_attempts WHERE client_ip=%s AND username_hash=%s",
+            (remote_ip, username_key),
+        ).fetchone()
+        if attempt and attempt[1] and attempt[1] > datetime.now(timezone.utc):
+            return jsonify(message="Too many recovery attempts. Wait 15 minutes and try again."), 429
+        row = conn.execute("SELECT value FROM app_state WHERE key='manual_users' FOR UPDATE").fetchone()
+        users = row[0] if row else []
+        account = next((u for u in users if str(u.get("username", "")).casefold() == username.casefold()
+                        and u.get("enabled", True) and u.get("password_hash")), None)
+        hashes = account.get("recovery_answer_hashes", []) if account else []
+        usable_hashes = hashes if isinstance(hashes, list) and len(hashes) == len(RECOVERY_QUESTIONS) else [RECOVERY_DUMMY_HASH] * len(RECOVERY_QUESTIONS)
+        checks = [matches_recovery_answer(stored, answer) for stored, answer in zip(usable_hashes, normalized)]
+        valid = bool(account and len(hashes) == len(RECOVERY_QUESTIONS) and all(checks))
+        if valid:
+            account["password_hash"] = generate_password_hash(new_password)
+            account["auth_version"] = int(account.get("auth_version", 0) or 0) + 1
+            conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='manual_users'", (json.dumps(users),))
+            conn.execute("DELETE FROM recovery_attempts WHERE client_ip=%s AND username_hash=%s", (remote_ip, username_key))
+            conn.execute("DELETE FROM login_attempts WHERE client_ip=%s", (remote_ip,))
+        else:
+            conn.execute(
+                "INSERT INTO recovery_attempts(client_ip,username_hash,failures,blocked_until) VALUES(%s,%s,1,NULL) "
+                "ON CONFLICT(client_ip,username_hash) DO UPDATE SET failures=recovery_attempts.failures+1, "
+                "blocked_until=CASE WHEN recovery_attempts.failures+1>=5 THEN now()+interval '15 minutes' ELSE NULL END",
+                (remote_ip, username_key),
+            )
+    return jsonify(message=RECOVERY_GENERIC_MESSAGE), 200
+
+
+@app.post("/api/account/recovery-answers")
+@signed_in
+def update_recovery_answers():
+    body = request.get_json(silent=True) or {}
+    current_password = str(body.get("current_password", ""))
+    hashes = recovery_answer_hashes(body.get("answers"))
+    if not hashes:
+        return jsonify(error="Answer all three recovery questions with 3–200 characters each."), 400
+    username = session["profile"].get("username", "")
+    with db() as conn:
+        row = conn.execute("SELECT value FROM app_state WHERE key='manual_users' FOR UPDATE").fetchone()
+        users = row[0] if row else []
+        account = next((u for u in users if str(u.get("username", "")).casefold() == username.casefold()), None)
+        if not account or not account.get("password_hash") or not check_password_hash(account["password_hash"], current_password):
+            return jsonify(error="Current password is incorrect."), 400
+        account["recovery_answer_hashes"] = hashes
+        conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='manual_users'", (json.dumps(users),))
+    return jsonify(ok=True, message="Recovery answers saved securely.")
 
 
 @app.post("/api/logout")
@@ -655,7 +780,9 @@ def change_account_password():
         if not check_password_hash(account["password_hash"], current_password):
             return jsonify(error="Current password is incorrect"), 400
         account["password_hash"] = generate_password_hash(new_password)
+        account["auth_version"] = int(account.get("auth_version", 0) or 0) + 1
         conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='manual_users'", (json.dumps(users),))
+        session["auth_version"] = account["auth_version"]
     return jsonify(ok=True, message="Password changed successfully")
 
 
@@ -667,7 +794,7 @@ def get_data():
         keys = ("assets", "software", "departments", "maintenance", "manual_users", "settings")
         out = {k: (conn.execute("SELECT value FROM app_state WHERE key=%s", (k,)).fetchone() or ([],))[0] for k in keys}
         if session.get("is_admin"):
-            out["users"] = [{k:v for k,v in u.items() if k != "password_hash"} | {"source":"manual"} for u in out.pop("manual_users", [])]
+            out["users"] = [{k:v for k,v in u.items() if k not in ("password_hash", "recovery_answer_hashes")} | {"source":"manual"} for u in out.pop("manual_users", [])]
         else:
             out.pop("manual_users", None)
             out.pop("settings", None)
@@ -704,8 +831,12 @@ def save_data():
                             if len(new_password) < 10 or len(new_password) > 1024:
                                 return jsonify(error="Account passwords must be at least 10 characters long."), 400
                             user["password_hash"] = generate_password_hash(new_password)
+                            user["auth_version"] = int(prior.get("auth_version", 0) or 0) + 1
                         elif prior.get("password_hash"):
                             user["password_hash"] = prior["password_hash"]
+                            user["auth_version"] = int(prior.get("auth_version", 0) or 0)
+                        if prior.get("recovery_answer_hashes"):
+                            user["recovery_answer_hashes"] = prior["recovery_answer_hashes"]
                         if "password_hash" not in user:
                             user["password_hash"] = ""
                         user["username"] = username
