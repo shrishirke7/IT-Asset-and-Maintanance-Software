@@ -125,6 +125,22 @@ def run_task(task):
             pass
 
 
+def run_ip_status_task(task):
+    task_id = task.get("id", "")
+    targets = task.get("ips", [])
+    online = []
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=64) as pool:
+            futures = {pool.submit(probe, ipaddress.ip_address(value)): value for value in targets}
+            for future in concurrent.futures.as_completed(futures):
+                if future.result():
+                    online.append(futures[future])
+        request_json("/api/internal/ip-status-results", {"id":task_id, "online":online}, timeout=20)
+        print(f"IP status check complete: {len(online)} of {len(targets)} online", flush=True)
+    except Exception as exc:
+        print(f"IP status check failed: {type(exc).__name__}", flush=True)
+
+
 def main():
     if len(TOKEN) < 40:
         raise SystemExit("APP_SECRET must be configured before the scanner agent starts")
@@ -139,6 +155,10 @@ def main():
             if task:
                 print(f"Starting authorized scan {task['id']} over {task.get('total', 0)} addresses", flush=True)
                 run_task(task)
+                continue
+            status_task = request_json("/api/internal/ip-status-task", timeout=5)
+            if status_task:
+                run_ip_status_task(status_task)
             else:
                 time.sleep(POLL_SECONDS)
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:

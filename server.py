@@ -78,7 +78,7 @@ def init_db():
         for statement in schema.split(";"):
             if statement.strip():
                 conn.execute(statement)
-        conn.execute("INSERT INTO app_state(key,value) VALUES('assets','[]'),('software','[]'),('departments','[]'),('maintenance','[]'),('manual_users','[]'),('network_ranges','[]'),('network_scan','{}'),('scanner_heartbeat','{}'),('settings','{}') ON CONFLICT(key) DO NOTHING")
+        conn.execute("INSERT INTO app_state(key,value) VALUES('assets','[]'),('software','[]'),('departments','[]'),('maintenance','[]'),('manual_users','[]'),('network_ranges','[]'),('network_scan','{}'),('scanner_heartbeat','{}'),('scanner_ip_status','{}'),('settings','{}') ON CONFLICT(key) DO NOTHING")
 
 
 def signed_in(fn):
@@ -390,6 +390,112 @@ def start_network_scan():
 def _scanner_authorized():
     supplied = request.headers.get("X-Northstar-Scanner", "")
     return bool(supplied) and secrets.compare_digest(supplied, APP_SECRET)
+
+
+@app.get("/api/internal/ip-status-task")
+def scanner_ip_status_task():
+    if not _scanner_authorized():
+        abort(403)
+    now = datetime.now(timezone.utc)
+    with db() as conn:
+        row = conn.execute("SELECT value FROM app_state WHERE key='scanner_ip_status' FOR UPDATE").fetchone()
+        state = row[0] if row else {}
+        prior_time = state.get("finished_at") or state.get("started_at") or ""
+        if prior_time:
+            try:
+                elapsed = (now - datetime.fromisoformat(prior_time)).total_seconds()
+                if (not state.get("finished_at") and elapsed < 120) or (state.get("finished_at") and elapsed < 30):
+                    return ("", 204)
+            except (ValueError, TypeError):
+                pass
+        ranges = (conn.execute("SELECT value FROM app_state WHERE key='network_ranges'").fetchone() or ([],))[0]
+        if not ranges:
+            return ("", 204)
+        networks = [ipaddress.ip_network(value, strict=True) for value in ranges]
+        inventory = (conn.execute("SELECT value FROM app_state WHERE key='assets'").fetchone() or ([],))[0]
+        users = (conn.execute("SELECT value FROM app_state WHERE key='manual_users'").fetchone() or ([],))[0]
+        targets = set()
+        for item, fields in [(a, ("ipAddress", "ip_address")) for a in inventory] + [(u, ("ip_address", "ipAddress")) for u in users]:
+            raw_ip = next((item.get(key) for key in fields if item.get(key)), "")
+            try:
+                ip = ipaddress.ip_address(str(raw_ip).strip())
+            except ValueError:
+                continue
+            if ip.version == 4 and ip.is_private and any(ip in network for network in networks):
+                targets.add(str(ip))
+        if not targets:
+            return ("", 204)
+        task_id = str(uuid.uuid4())
+        state = {"id":task_id,"targets":sorted(targets, key=lambda value:tuple(int(part) for part in value.split("."))),"started_at":now.isoformat(),"finished_at":""}
+        conn.execute("INSERT INTO app_state(key,value) VALUES('scanner_ip_status',%s::jsonb) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=now()", (json.dumps(state),))
+    return jsonify(id=task_id, ips=state["targets"])
+
+
+@app.post("/api/internal/ip-status-results")
+def scanner_ip_status_results():
+    if not _scanner_authorized():
+        abort(403)
+    body = request.get_json(force=True)
+    task_id = str(body.get("id", ""))
+    responsive = set()
+    rows = body.get("online", [])
+    if not task_id or not isinstance(rows, list) or len(rows) > 1024:
+        return jsonify(error="Invalid IP status result"), 400
+    for value in rows:
+        try:
+            ip = ipaddress.ip_address(str(value))
+            if ip.version == 4 and ip.is_private:
+                responsive.add(str(ip))
+        except ValueError:
+            continue
+    checked_at = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        row = conn.execute("SELECT value FROM app_state WHERE key='scanner_ip_status' FOR UPDATE").fetchone()
+        state = row[0] if row else {}
+        if state.get("id") != task_id or state.get("finished_at"):
+            return jsonify(error="IP status task is no longer active"), 409
+        ranges = (conn.execute("SELECT value FROM app_state WHERE key='network_ranges'").fetchone() or ([],))[0]
+        networks = [ipaddress.ip_network(value, strict=True) for value in ranges]
+        target_set = set()
+        for value in state.get("targets", []):
+            try:
+                ip = ipaddress.ip_address(value)
+                if ip.version == 4 and ip.is_private and any(ip in network for network in networks):
+                    target_set.add(str(ip))
+            except ValueError:
+                continue
+        responsive.intersection_update(target_set)
+        inventory_row = conn.execute("SELECT value FROM app_state WHERE key='assets' FOR UPDATE").fetchone()
+        inventory = inventory_row[0] if inventory_row else []
+        users_row = conn.execute("SELECT value FROM app_state WHERE key='manual_users' FOR UPDATE").fetchone()
+        users = users_row[0] if users_row else []
+        assets_changed = users_changed = False
+        for asset in inventory:
+            raw_ip = str(asset.get("ipAddress", asset.get("ip_address", ""))).strip()
+            if raw_ip not in target_set:
+                continue
+            asset["status"] = asset["ipStatus"] = "Online" if raw_ip in responsive else "Offline"
+            asset["ipCheckedAt"] = checked_at
+            if raw_ip in responsive:
+                asset["lastSeen"] = checked_at
+            assets_changed = True
+        for user in users:
+            raw_ip = str(user.get("ip_address", user.get("ipAddress", ""))).strip()
+            if raw_ip not in target_set:
+                continue
+            user["ipStatus"] = "Online" if raw_ip in responsive else "Offline"
+            user["ipCheckedAt"] = checked_at
+            if raw_ip in responsive:
+                user["lastSeen"] = checked_at
+            users_changed = True
+        if assets_changed:
+            conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='assets'", (json.dumps(inventory),))
+        if users_changed:
+            conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='manual_users'", (json.dumps(users),))
+        state["finished_at"] = checked_at
+        state["online_count"] = len(responsive)
+        conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='scanner_ip_status'", (json.dumps(state),))
+    return jsonify(ok=True, online=len(responsive), checked=len(target_set))
 
 
 @app.post("/api/internal/scanner-heartbeat")
