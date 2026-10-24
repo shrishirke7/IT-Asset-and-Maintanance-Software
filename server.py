@@ -89,7 +89,7 @@ def init_db():
         for statement in schema.split(";"):
             if statement.strip():
                 conn.execute(statement)
-        conn.execute("INSERT INTO app_state(key,value) VALUES('assets','[]'),('software','[]'),('departments','[]'),('maintenance','[]'),('manual_users','[]'),('network_ranges','[]'),('network_scan','{}'),('scanner_heartbeat','{}'),('scanner_ip_status','{}'),('settings','{}'),('notifications','{\"rules\":[],\"queue\":[]}') ON CONFLICT(key) DO NOTHING")
+        conn.execute("INSERT INTO app_state(key,value) VALUES('assets','[]'),('software','[]'),('departments','[]'),('maintenance','[]'),('manual_users','[]'),('network_ranges','[]'),('network_scan','{}'),('scanner_heartbeat','{}'),('scanner_ip_status','{}'),('settings','{}'),('profile_preferences','{}'),('notifications','{\"rules\":[],\"queue\":[]}') ON CONFLICT(key) DO NOTHING")
 
 
 def signed_in(fn):
@@ -943,6 +943,42 @@ def logout():
 @signed_in
 def profile():
     return jsonify(profile=session["profile"], isAdmin=session["is_admin"])
+
+
+@app.get("/api/profile/preferences")
+@signed_in
+def get_profile_preferences():
+    username = str(session["profile"].get("username", ""))
+    with db() as conn:
+        row = conn.execute("SELECT value FROM app_state WHERE key='profile_preferences'").fetchone()
+    preferences = row[0] if row and isinstance(row[0], dict) else {}
+    return jsonify(preferences=preferences.get(username, {}))
+
+
+@app.put("/api/profile/preferences")
+@signed_in
+def save_profile_preferences():
+    payload = request.get_json(silent=True) or {}
+    valid_views = {"dashboard", "assets", "datacenter", "tickets", "maintenance", "ageing",
+                   "users", "departments", "software", "monitoring", "notifications",
+                   "surveillance", "reports"}
+    order = payload.get("order")
+    hidden = payload.get("hidden", [])
+    if (not isinstance(order, list) or not isinstance(hidden, list)
+            or len(order) > len(valid_views) or len(hidden) > len(valid_views)
+            or any(not isinstance(item, str) or item not in valid_views for item in order + hidden)):
+        return jsonify(error="Invalid module preferences."), 400
+    normalized_order = list(dict.fromkeys(order))
+    normalized_order.extend(sorted(valid_views - set(normalized_order)))
+    normalized = {"order": normalized_order, "hidden": list(dict.fromkeys(hidden))}
+    username = str(session["profile"].get("username", ""))
+    with db() as conn:
+        conn.execute("INSERT INTO app_state(key,value) VALUES('profile_preferences','{}') ON CONFLICT(key) DO NOTHING")
+        row = conn.execute("SELECT value FROM app_state WHERE key='profile_preferences' FOR UPDATE").fetchone()
+        preferences = row[0] if row and isinstance(row[0], dict) else {}
+        preferences[username] = normalized
+        conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='profile_preferences'", (json.dumps(preferences),))
+    return jsonify(ok=True, preferences=normalized)
 
 
 @app.get("/portal")
