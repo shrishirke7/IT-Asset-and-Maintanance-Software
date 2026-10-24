@@ -300,6 +300,7 @@ window.showNotifications=function(){go('notifications');window.loadNotificationM
 (()=>{
  const types=['CCTV','NVR','DVR'];
  const form=document.getElementById('assetForm'),typeSelect=form.elements.namedItem('type'),subtype=form.elements.namedItem('subtype'),subField=document.getElementById('assetSubtypeField');
+ if(![...typeSelect.options].some(o=>o.value==='Surveillance'||o.textContent.trim()==='Surveillance')){const option=document.createElement('option');option.value='Surveillance';option.textContent='Surveillance';typeSelect.appendChild(option)}
  const invType=document.getElementById('typeFilter');
  if(invType&&! [...invType.options].some(o=>o.value==='Surveillance')){const o=document.createElement('option');o.value='Surveillance';o.textContent='Surveillance';invType.appendChild(o)}
  function assetKind(a){return a.type==='Surveillance'?(a.subtype||'CCTV'):a.type}
