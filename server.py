@@ -145,6 +145,13 @@ def check_api_origin():
             abort(403)
 
 
+@app.before_request
+def viewer_accounts_are_read_only():
+    profile = session.get("profile") or {}
+    if profile.get("role") == "Viewer" and request.path.startswith("/api/") and request.method in ("POST", "PUT", "PATCH", "DELETE") and request.path != "/api/logout":
+        return jsonify(error="Viewer accounts have read-only access."), 403
+
+
 @app.after_request
 def add_security_headers(response):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -1201,6 +1208,8 @@ def get_data():
         out = {k: (conn.execute("SELECT value FROM app_state WHERE key=%s", (k,)).fetchone() or ([],))[0] for k in keys}
         if session.get("is_admin"):
             out["users"] = [{k:v for k,v in u.items() if k not in ("password_hash", "recovery_answer_hashes")} | {"source":"manual"} for u in out.pop("manual_users", [])]
+        elif who.get("role") == "Viewer":
+            out["users"] = [{k:v for k,v in u.items() if k not in ("password_hash", "recovery_answer_hashes")} | {"source":"manual"} for u in out.pop("manual_users", [])]
         else:
             out.pop("manual_users", None)
             out.pop("settings", None)
@@ -1313,7 +1322,7 @@ def save_data():
                         if "password_hash" not in user:
                             user["password_hash"] = ""
                         user["username"] = username
-                        user["role"] = user.get("role") if user.get("role") in ("Administrator", "IT Ticketing") else "User"
+                        user["role"] = user.get("role") if user.get("role") in ("Administrator", "IT Ticketing", "Viewer") else "User"
                         user["enabled"] = user.get("enabled", True)
                         clean.append(user)
                     if not any(u.get("enabled", True) and u.get("role") == "Administrator" and u.get("password_hash") for u in clean):
@@ -1334,7 +1343,7 @@ TICKET_COLUMNS = "id,kind,username,display_name,department,factory,client_ip,pri
 @signed_in
 def list_tickets():
     with db() as conn:
-        if session.get("is_admin") or session.get("profile", {}).get("role") == "IT Ticketing":
+        if session.get("is_admin") or session.get("profile", {}).get("role") in ("IT Ticketing", "Viewer"):
             rows = conn.execute(f"SELECT {TICKET_COLUMNS} FROM tickets ORDER BY created_at DESC LIMIT 1000").fetchall()
         else:
             rows = conn.execute(f"SELECT {TICKET_COLUMNS} FROM tickets WHERE username=%s ORDER BY created_at DESC LIMIT 250", (session["profile"]["username"],)).fetchall()
@@ -1348,7 +1357,7 @@ def ticket_attachment(ticket_id, filename):
         row = conn.execute("SELECT username,attachments FROM tickets WHERE id=%s", (ticket_id,)).fetchone()
     if not row:
         abort(404)
-    if not session.get("is_admin") and session.get("profile", {}).get("role") != "IT Ticketing" and row[0] != session["profile"]["username"]:
+    if not session.get("is_admin") and session.get("profile", {}).get("role") not in ("IT Ticketing", "Viewer") and row[0] != session["profile"]["username"]:
         abort(403)
     match = next((item for item in row[1] if Path(item.get("path", "")).name == filename), None)
     if not match:
