@@ -968,7 +968,7 @@ def save_profile_preferences():
     payload = request.get_json(silent=True) or {}
     valid_views = {"dashboard", "assets", "datacenter", "tickets", "maintenance", "ageing",
                    "users", "departments", "software", "monitoring", "notifications",
-                   "surveillance", "reports"}
+                   "surveillance", "parts", "reports"}
     order = payload.get("order")
     hidden = payload.get("hidden", [])
     if (not isinstance(order, list) or not isinstance(hidden, list)
