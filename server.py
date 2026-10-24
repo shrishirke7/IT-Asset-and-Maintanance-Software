@@ -42,14 +42,14 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SECURE=os.getenv("COOKIE_SECURE", "true").lower() == "true",
     SESSION_COOKIE_SAMESITE="Lax",
-    MAX_CONTENT_LENGTH=12 * 1024 * 1024,
+    MAX_CONTENT_LENGTH=64 * 1024 * 1024,
     PERMANENT_SESSION_LIFETIME=60 * 60 * 8,
 )
 
 
 @app.before_request
 def pause_api_during_restore():
-    request.max_content_length = 1024 * 1024 * 1024 if request.path == "/api/backups/restore" else 12 * 1024 * 1024
+    request.max_content_length = 1024 * 1024 * 1024 if request.path == "/api/backups/restore" else 64 * 1024 * 1024
     if request.path.startswith("/api/") and RESTORE_LOCK_PATH.exists():
         return jsonify(error="A backup restore is in progress. Please try again shortly."), 503
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -257,9 +257,9 @@ def save_login_image(upload):
     ext = Path(upload.filename).suffix.lower()
     if ext not in (".png", ".jpg", ".jpeg", ".webp"):
         raise ValueError("Use PNG, JPG, or WebP images only")
-    data = upload.stream.read(1536 * 1024 + 1)
-    if not data or len(data) > 1536 * 1024:
-        raise ValueError("Each sign-in image must be between 1 byte and 1.5 MB")
+    data = upload.stream.read(10 * 1024 * 1024 + 1)
+    if not data or len(data) > 10 * 1024 * 1024:
+        raise ValueError("Each sign-in image must be between 1 byte and 10 MB")
     valid = (ext == ".png" and data.startswith(b"\x89PNG\r\n\x1a\n")) or (ext in (".jpg", ".jpeg") and data.startswith(b"\xff\xd8\xff")) or (ext == ".webp" and data.startswith(b"RIFF") and data[8:12] == b"WEBP")
     if not valid:
         raise ValueError("The uploaded file does not match its image type")
