@@ -89,7 +89,7 @@ def init_db():
         for statement in schema.split(";"):
             if statement.strip():
                 conn.execute(statement)
-        conn.execute("INSERT INTO app_state(key,value) VALUES('assets','[]'),('software','[]'),('departments','[]'),('maintenance','[]'),('parts_inventory','[]'),('parts_assignments','[]'),('manual_users','[]'),('network_ranges','[]'),('network_scan','{}'),('scanner_heartbeat','{}'),('scanner_ip_status','{}'),('settings','{}'),('profile_preferences','{}'),('notifications','{\"rules\":[],\"queue\":[]}') ON CONFLICT(key) DO NOTHING")
+        conn.execute("INSERT INTO app_state(key,value) VALUES('assets','[]'),('software','[]'),('departments','[]'),('maintenance','[]'),('parts_catalog','[]'),('parts_inventory','[]'),('parts_stock_entries','[]'),('parts_assignments','[]'),('manual_users','[]'),('network_ranges','[]'),('network_scan','{}'),('scanner_heartbeat','{}'),('scanner_ip_status','{}'),('settings','{}'),('profile_preferences','{}'),('notifications','{\"rules\":[],\"queue\":[]}') ON CONFLICT(key) DO NOTHING")
 
 
 def signed_in(fn):
@@ -1204,7 +1204,7 @@ def change_account_password():
 def get_data():
     who = session["profile"]
     with db() as conn:
-        keys = ("assets", "software", "departments", "maintenance", "parts_inventory", "parts_assignments", "manual_users", "settings")
+        keys = ("assets", "software", "departments", "maintenance", "parts_catalog", "parts_inventory", "parts_stock_entries", "parts_assignments", "manual_users", "settings")
         out = {k: (conn.execute("SELECT value FROM app_state WHERE key=%s", (k,)).fetchone() or ([],))[0] for k in keys}
         if session.get("is_admin"):
             out["users"] = [{k:v for k,v in u.items() if k not in ("password_hash", "recovery_answer_hashes")} | {"source":"manual"} for u in out.pop("manual_users", [])]
@@ -1214,6 +1214,8 @@ def get_data():
             out.pop("manual_users", None)
             out.pop("settings", None)
             out["parts_inventory"] = []
+            out["parts_catalog"] = []
+            out["parts_stock_entries"] = []
             out["parts_assignments"] = []
             out["assets"] = [a for a in out["assets"] if str(a.get("owner", "")).casefold() in (who["username"].casefold(), who["name"].casefold(), who.get("email", "").casefold())]
             out["software"] = []
@@ -1227,7 +1229,7 @@ def get_data():
 def save_data():
     body = request.get_json(force=True)
     with db() as conn:
-        for key in ("assets", "software", "departments", "maintenance", "parts_inventory", "parts_assignments", "manual_users", "settings"):
+        for key in ("assets", "software", "departments", "maintenance", "parts_catalog", "parts_inventory", "parts_stock_entries", "parts_assignments", "manual_users", "settings"):
             if key in body:
                 value = body[key]
                 if key == "assets" and isinstance(value, list):
