@@ -15,3 +15,6 @@ docker compose up -d --build app
 If the project uses a different Compose service name, rebuild the existing application service with its configured name. Do not run `docker compose down -v` or remove the PostgreSQL volume; this update is intended to keep the current data. After the container is healthy, reload the site with Ctrl+F5.
 
 Existing combined part/stock rows are linked into the new product catalog automatically when loaded. The current balance and assignment references remain in place.
+## Factory / location settings update
+
+The Settings page now includes actions to remove a factory after its assets, users, departments, maintenance, parts, and tickets have been moved. Factory/location terminology can be customized with separate singular and plural labels; the labels are applied across the interface. The built-in factory codes are also removable when unused.
