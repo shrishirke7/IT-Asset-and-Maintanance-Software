@@ -866,7 +866,7 @@ def snmp_results():
         row = conn.execute("SELECT value FROM app_state WHERE key='snmp_samples' FOR UPDATE").fetchone()
         samples = row[0] if row and isinstance(row[0], list) else []
         samples.extend(clean_samples)
-        cutoff = now.timestamp() - 86400
+        cutoff = datetime.now(timezone.utc).timestamp() - 86400
         retained = []
         for sample in samples:
             try:
