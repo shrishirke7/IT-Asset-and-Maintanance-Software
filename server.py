@@ -295,7 +295,7 @@ def get_camera_streams():
             item["gatewayReady"] = True
         except (KeyError, ValueError, InvalidToken, URLError, HTTPError, TimeoutError, OSError):
             item["gatewayReady"] = False
-    public = [{k: item.get(k, "") for k in ("assetTag", "room", "hub", "channel", "stream", "streamName", "sourceType", "ip", "rtspReachable")}
+    public = [{k: item.get(k, "") for k in ("assetTag", "room", "hub", "channel", "stream", "streamName", "sourceType", "profile", "protocol", "ip", "rtspReachable")}
               for item in items if isinstance(item, dict)]
     for item, safe in zip((x for x in items if isinstance(x, dict)), public):
         safe["gatewayReady"] = bool(item.get("gatewayReady"))
@@ -310,6 +310,7 @@ def save_camera_stream():
     room = str(body.get("room", "")).strip()[:100]
     hub = str(body.get("hub", "")).strip()[:100]
     source_type = str(body.get("sourceType", "nvr")).lower()
+    profile = str(body.get("profile", "")).strip().lower()
     stream = str(body.get("stream", "main")).lower()
     username = str(body.get("username", "")).strip()[:128]
     password = str(body.get("password", ""))[:256]
@@ -318,15 +319,52 @@ def save_camera_stream():
         port = int(body.get("port", 554))
         camera_ip = ipaddress.ip_address(str(body.get("ip", "")).strip())
     except (ValueError, TypeError):
-        return jsonify(error="Enter a valid private camera/NVR IP, RTSP port, and channel."), 400
+        return jsonify(error="Enter a valid private camera/NVR IP, stream port, and channel."), 400
     if camera_ip.is_global or camera_ip.is_multicast or camera_ip.is_unspecified or camera_ip.is_loopback or camera_ip.is_link_local or camera_ip.is_reserved:
         return jsonify(error="Use the camera/NVR's private VLAN IP address."), 400
     if not asset_tag:
         return jsonify(error="Select a saved CCTV asset with an asset tag. Register this device as Surveillance → CCTV first."), 400
     if not room or not hub or not username or not password:
         return jsonify(error="Enter the hub, room, camera username, and camera password."), 400
-    if source_type not in ("nvr", "camera") or stream not in ("main", "sub") or not 1 <= channel <= 256 or port not in (554, 8554):
-        return jsonify(error="Use RTSP port 554 (or 8554 if your UNV device was configured for it), and check the source, channel, and stream type."), 400
+    if stream not in ("main", "sub") or not 1 <= channel <= 256 or not 1 <= port <= 65535:
+        return jsonify(error="Check the stream quality, channel number, and TCP port (1–65535)."), 400
+    stream_path = str(body.get("streamPath", "")).strip()[:512]
+    protocol = "rtsp"
+    if profile:
+        if profile == "unv_camera":
+            source_type, protocol = "camera", "rtsp"
+            stream_path = stream_path or f"/media/video{'1' if stream == 'main' else '2'}"
+        elif profile == "unv_nvr":
+            source_type, protocol = "nvr", "rtsp"
+            stream_path = stream_path or f"/unicast/c{channel}/s{'0' if stream == 'main' else '1'}/live"
+        elif profile == "hikvision":
+            source_type, protocol = "camera", "rtsp"
+            stream_path = stream_path or f"/Streaming/Channels/{channel}0{'1' if stream == 'main' else '2'}"
+        elif profile == "dahua":
+            source_type, protocol = "camera", "rtsp"
+            stream_path = stream_path or f"/cam/realmonitor?channel={channel}&subtype={'0' if stream == 'main' else '1'}"
+        elif profile == "axis":
+            source_type, protocol = "camera", "rtsp"
+            stream_path = stream_path or "/axis-media/media.amp"
+        elif profile == "custom_rtsp":
+            source_type, protocol = "camera", "rtsp"
+        elif profile == "http_mjpeg":
+            source_type, protocol = "camera", "http"
+            port = int(body.get("port") or 80)
+        elif profile == "https_mjpeg":
+            source_type, protocol = "camera", "https"
+            port = int(body.get("port") or 443)
+        else:
+            return jsonify(error="Choose a supported camera profile."), 400
+    elif source_type in ("nvr", "camera"):
+        protocol = "rtsp"
+        stream_path = (f"/unicast/c{channel}/s{'0' if stream == 'main' else '1'}/live" if source_type == "nvr"
+                       else f"/media/video{'1' if stream == 'main' else '2'}")
+    else:
+        return jsonify(error="Choose a supported camera profile."), 400
+    if (not stream_path.startswith("/") or stream_path.startswith("//")
+            or any(ord(ch) < 32 for ch in stream_path)):
+        return jsonify(error="Enter a valid stream path starting with /; use the camera's video endpoint, not its web login page."), 400
     rtsp_reachable = False
     try:
         with socket.create_connection((str(camera_ip), port), timeout=2):
@@ -345,20 +383,18 @@ def save_camera_stream():
             return jsonify(error="This CCTV asset already has a live-feed setup. Remove it before adding it again."), 409
         stream_name = "cam_" + hmac.new(APP_SECRET.encode(), asset_tag.encode(), hashlib.sha256).hexdigest()[:24]
         host = f"[{camera_ip.compressed}]" if camera_ip.version == 6 else camera_ip.compressed
-        path = (f"/unicast/c{channel}/s{'0' if stream == 'main' else '1'}/live" if source_type == "nvr"
-                else f"/media/video{'1' if stream == 'main' else '2'}")
-        source = f"rtsp://{quote(username, safe='')}:{quote(password, safe='')}@{host}:{port}{path}"
+        source = f"{protocol}://{quote(username, safe='')}:{quote(password, safe='')}@{host}:{port}{stream_path}"
         try:
             go2rtc_request("PUT", "/api/streams", {"name": stream_name, "src": source})
         except HTTPError as exc:
-            # Keep the gateway response body private: it may echo the RTSP source URL,
+            # Keep the gateway response body private: it may echo the camera stream URL,
             # which contains the camera credentials. The status code is safe and
             # distinguishes a reachable API rejecting the request from a network failure.
             try:
                 detail = exc.read(512).decode("utf-8", "replace").strip()
             except OSError:
                 detail = ""
-            detail = re.sub(r"(?i)rtsp://[^\s\"'<>]+", "rtsp://[redacted]", detail)[:400]
+            detail = re.sub(r"(?i)(?:rtsp|https?)://[^\s\"'<>]+", "[stream URL redacted]", detail)[:400]
             message = f"The live-video gateway responded with HTTP {exc.code}."
             if detail:
                 message += " " + detail
@@ -366,13 +402,14 @@ def save_camera_stream():
         except (URLError, TimeoutError, OSError):
             return jsonify(error="The app cannot reach the go2rtc API at go2rtc:1984. Check Docker service networking and confirm go2rtc is running."), 503
         item = {"assetTag": asset_tag, "room": room, "hub": hub, "channel": channel, "stream": stream,
-                "sourceType": source_type, "streamName": stream_name, "ip": camera_ip.compressed,
+                "sourceType": source_type, "profile": profile or ("unv_nvr" if source_type == "nvr" else "unv_camera"),
+                "protocol": protocol.upper(), "streamName": stream_name, "ip": camera_ip.compressed,
                 "rtspReachable": rtsp_reachable,
                 "encryptedSource": camera_secret_box().encrypt(source.encode()).decode()}
         items.append(item)
         conn.execute("INSERT INTO app_state(key,value) VALUES('camera_streams',%s::jsonb) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=now()",
                      (json.dumps(items),))
-    return jsonify(ok=True, rtspReachable=rtsp_reachable, item={k: item[k] for k in ("assetTag", "room", "hub", "channel", "stream", "streamName", "sourceType", "ip", "rtspReachable")}), 201
+    return jsonify(ok=True, rtspReachable=rtsp_reachable, item={k: item[k] for k in ("assetTag", "room", "hub", "channel", "stream", "streamName", "sourceType", "profile", "protocol", "ip", "rtspReachable")}), 201
 
 
 @app.delete("/api/admin/camera-streams/<asset_tag>")
