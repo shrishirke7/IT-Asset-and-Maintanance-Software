@@ -97,7 +97,7 @@ services:
           listen: ":8555"
           candidates:
             - "$${WEBRTC_CANDIDATE}:8555"
-        streams: {}
+        streams:
         EOF
         fi
     environment:
