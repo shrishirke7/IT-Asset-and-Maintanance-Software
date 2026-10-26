@@ -354,7 +354,15 @@ def save_camera_stream():
             # Keep the gateway response body private: it may echo the RTSP source URL,
             # which contains the camera credentials. The status code is safe and
             # distinguishes a reachable API rejecting the request from a network failure.
-            return jsonify(error=f"The live-video gateway responded with HTTP {exc.code}. Check the go2rtc logs for the stream setup error."), 502
+            try:
+                detail = exc.read(512).decode("utf-8", "replace").strip()
+            except OSError:
+                detail = ""
+            detail = re.sub(r"(?i)rtsp://[^\s\"'<>]+", "rtsp://[redacted]", detail)[:400]
+            message = f"The live-video gateway responded with HTTP {exc.code}."
+            if detail:
+                message += " " + detail
+            return jsonify(error=message), 502
         except (URLError, TimeoutError, OSError):
             return jsonify(error="The app cannot reach the go2rtc API at go2rtc:1984. Check Docker service networking and confirm go2rtc is running."), 503
         item = {"assetTag": asset_tag, "room": room, "hub": hub, "channel": channel, "stream": stream,
