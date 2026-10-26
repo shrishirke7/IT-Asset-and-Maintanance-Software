@@ -32,6 +32,24 @@ UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", ROOT / "uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 BACKUP_DIR = Path(os.getenv("BACKUP_DIR", "/backups"))
 RESTORE_LOCK_PATH = Path("/tmp/northstar-restore-in-progress")
+DEFAULT_CAMERA_PROFILES = [
+    {"id": "unv_camera", "name": "UNV · Direct camera", "protocol": "rtsp", "port": 554,
+     "mainPath": "/media/video1", "subPath": "/media/video2", "requiresChannel": False, "sourceType": "camera"},
+    {"id": "unv_nvr", "name": "UNV · NVR channel", "protocol": "rtsp", "port": 554,
+     "mainPath": "/unicast/c{channel}/s0/live", "subPath": "/unicast/c{channel}/s1/live", "requiresChannel": True, "sourceType": "nvr"},
+    {"id": "hikvision", "name": "Hikvision · Camera/NVR", "protocol": "rtsp", "port": 10554,
+     "mainPath": "/Streaming/Channels/{channelStream}", "subPath": "/Streaming/Channels/{channelStream}", "requiresChannel": True, "sourceType": "camera"},
+    {"id": "dahua", "name": "Dahua · Camera/NVR", "protocol": "rtsp", "port": 554,
+     "mainPath": "/cam/realmonitor?channel={channel}&subtype={streamIndex}", "subPath": "/cam/realmonitor?channel={channel}&subtype={streamIndex}", "requiresChannel": True, "sourceType": "camera"},
+    {"id": "axis", "name": "Axis · Camera", "protocol": "rtsp", "port": 554,
+     "mainPath": "/axis-media/media.amp", "subPath": "/axis-media/media.amp", "requiresChannel": False, "sourceType": "camera"},
+    {"id": "custom_rtsp", "name": "Other brand · Custom RTSP", "protocol": "rtsp", "port": 554,
+     "mainPath": "", "subPath": "", "requiresChannel": False, "sourceType": "camera"},
+    {"id": "http_mjpeg", "name": "HTTP · Direct MJPEG/HLS", "protocol": "http", "port": 80,
+     "mainPath": "", "subPath": "", "requiresChannel": False, "sourceType": "camera"},
+    {"id": "https_mjpeg", "name": "HTTPS · Direct MJPEG/HLS", "protocol": "https", "port": 443,
+     "mainPath": "", "subPath": "", "requiresChannel": False, "sourceType": "camera"},
+]
 LOGIN_MEDIA_DIR = UPLOAD_DIR / "login-branding"
 LOGIN_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 PROFILE_MEDIA_DIR = UPLOAD_DIR / 'profiles'
@@ -108,7 +126,7 @@ def init_db():
         for statement in schema.split(";"):
             if statement.strip():
                 conn.execute(statement)
-        conn.execute("INSERT INTO app_state(key,value) VALUES('assets','[]'),('software','[]'),('departments','[]'),('maintenance','[]'),('parts_catalog','[]'),('parts_inventory','[]'),('parts_stock_entries','[]'),('parts_assignments','[]'),('manual_users','[]'),('camera_streams','[]'),('network_ranges','[]'),('network_scan','{}'),('scanner_heartbeat','{}'),('scanner_ip_status','{}'),('settings','{}'),('profile_preferences','{}'),('notifications','{\"rules\":[],\"queue\":[]}') ON CONFLICT(key) DO NOTHING")
+        conn.execute("INSERT INTO app_state(key,value) VALUES('assets','[]'),('software','[]'),('departments','[]'),('maintenance','[]'),('parts_catalog','[]'),('parts_inventory','[]'),('parts_stock_entries','[]'),('parts_assignments','[]'),('manual_users','[]'),('camera_streams','[]'),('camera_profiles','[]'),('network_ranges','[]'),('network_scan','{}'),('scanner_heartbeat','{}'),('scanner_ip_status','{}'),('settings','{}'),('profile_preferences','{}'),('notifications','{\"rules\":[],\"queue\":[]}') ON CONFLICT(key) DO NOTHING")
 
 
 def signed_in(fn):
@@ -280,6 +298,70 @@ def cctv_media_auth():
     return "", 204
 
 
+def stored_camera_profiles():
+    with db() as conn:
+        row = conn.execute("SELECT value FROM app_state WHERE key='camera_profiles'").fetchone()
+    profiles = row[0] if row else []
+    return profiles if isinstance(profiles, list) and profiles else DEFAULT_CAMERA_PROFILES
+
+
+def valid_camera_profile_path(value, allow_empty=False):
+    path = str(value or "").strip()
+    if not path and allow_empty:
+        return ""
+    if (not path.startswith("/") or path.startswith("//") or len(path) > 512
+            or any(ord(ch) < 32 for ch in path)):
+        return None
+    tokens = set(re.findall(r"\{([^{}]+)\}", path))
+    remainder = re.sub(r"\{[^{}]+\}", "", path)
+    if ("{" in remainder or "}" in remainder
+            or not tokens.issubset({"channel", "stream", "streamIndex", "channelStream"})):
+        return None
+    return path
+
+
+@app.get("/api/camera-profiles")
+@signed_in
+def get_camera_profiles():
+    return jsonify(items=stored_camera_profiles())
+
+
+@app.put("/api/admin/camera-profiles")
+@administrator
+def save_camera_profiles():
+    body = request.get_json(force=True)
+    profiles = body.get("items") if isinstance(body, dict) else None
+    if not isinstance(profiles, list) or not 1 <= len(profiles) <= 50:
+        return jsonify(error="Save between 1 and 50 camera profiles."), 400
+    clean, ids = [], set()
+    for item in profiles:
+        if not isinstance(item, dict):
+            return jsonify(error="Each camera profile must be an object."), 400
+        profile_id = str(item.get("id", "")).strip().lower()[:40]
+        name = str(item.get("name", "")).strip()[:80]
+        protocol = str(item.get("protocol", "")).strip().lower()
+        try:
+            port = int(item.get("port", 0))
+        except (ValueError, TypeError):
+            port = 0
+        if (not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,39}", profile_id) or profile_id in ids
+                or not name or protocol not in ("rtsp", "http", "https") or not 1 <= port <= 65535):
+            return jsonify(error="Check each profile's unique ID, name, protocol and port."), 400
+        main_path = valid_camera_profile_path(item.get("mainPath"), allow_empty=protocol in ("http", "https"))
+        sub_path = valid_camera_profile_path(item.get("subPath"), allow_empty=True)
+        if main_path is None or sub_path is None:
+            return jsonify(error="Stream paths must start with / and can use {channel}, {stream}, {streamIndex}, or {channelStream}."), 400
+        ids.add(profile_id)
+        clean.append({"id": profile_id, "name": name, "protocol": protocol, "port": port,
+                      "mainPath": main_path, "subPath": sub_path,
+                      "requiresChannel": bool(item.get("requiresChannel")),
+                      "sourceType": "nvr" if str(item.get("sourceType", "camera")).lower() == "nvr" else "camera"})
+    with db() as conn:
+        conn.execute("INSERT INTO app_state(key,value) VALUES('camera_profiles',%s::jsonb) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=now()",
+                     (json.dumps(clean),))
+    return jsonify(ok=True, items=clean)
+
+
 @app.get("/api/camera-streams")
 @signed_in
 def get_camera_streams():
@@ -295,7 +377,7 @@ def get_camera_streams():
             item["gatewayReady"] = True
         except (KeyError, ValueError, InvalidToken, URLError, HTTPError, TimeoutError, OSError):
             item["gatewayReady"] = False
-    public = [{k: item.get(k, "") for k in ("assetTag", "room", "hub", "channel", "stream", "streamName", "sourceType", "profile", "protocol", "ip", "rtspReachable")}
+    public = [{k: item.get(k, "") for k in ("assetTag", "room", "hub", "channel", "stream", "streamName", "sourceType", "profile", "profileId", "profileName", "protocol", "ip", "rtspReachable")}
               for item in items if isinstance(item, dict)]
     for item, safe in zip((x for x in items if isinstance(x, dict)), public):
         safe["gatewayReady"] = bool(item.get("gatewayReady"))
@@ -310,7 +392,8 @@ def save_camera_stream():
     room = str(body.get("room", "")).strip()[:100]
     hub = str(body.get("hub", "")).strip()[:100]
     source_type = str(body.get("sourceType", "nvr")).lower()
-    profile = str(body.get("profile", "")).strip().lower()
+    legacy_profile = str(body.get("profile", "")).strip().lower()
+    profile_id = str(body.get("profileId", "")).strip().lower()
     stream = str(body.get("stream", "main")).lower()
     username = str(body.get("username", "")).strip()[:128]
     password = str(body.get("password", ""))[:256]
@@ -330,33 +413,49 @@ def save_camera_stream():
         return jsonify(error="Check the stream quality, channel number, and TCP port (1–65535)."), 400
     stream_path = str(body.get("streamPath", "")).strip()[:512]
     protocol = "rtsp"
-    if profile:
-        if profile == "unv_camera":
+    profile_name = ""
+    profile_data = next((p for p in stored_camera_profiles() if p.get("id") == profile_id), None) if profile_id else None
+    if profile_id and not profile_data:
+        return jsonify(error="That camera profile no longer exists. Refresh and select a saved profile."), 400
+    if profile_data:
+        protocol = profile_data["protocol"]
+        source_type = profile_data.get("sourceType", "camera")
+        profile_name = profile_data["name"]
+        port = int(body.get("port") or profile_data["port"])
+        template = profile_data.get("mainPath" if stream == "main" else "subPath") or profile_data.get("mainPath", "")
+        tokens = {"channel": str(channel), "stream": stream,
+                  "streamIndex": "0" if stream == "main" else "1",
+                  "channelStream": str(channel * 100 + (1 if stream == "main" else 2))}
+        configured_path = re.sub(r"\{(channel|stream|streamIndex|channelStream)\}", lambda m: tokens[m.group(1)], template)
+        stream_path = stream_path or configured_path
+    elif legacy_profile:
+        profile_name = legacy_profile.replace("_", " ").title()
+        if legacy_profile == "unv_camera":
             source_type, protocol = "camera", "rtsp"
             stream_path = stream_path or f"/media/video{'1' if stream == 'main' else '2'}"
-        elif profile == "unv_nvr":
+        elif legacy_profile == "unv_nvr":
             source_type, protocol = "nvr", "rtsp"
             stream_path = stream_path or f"/unicast/c{channel}/s{'0' if stream == 'main' else '1'}/live"
-        elif profile == "hikvision":
+        elif legacy_profile == "hikvision":
             source_type, protocol = "camera", "rtsp"
             stream_path = stream_path or f"/Streaming/Channels/{channel}0{'1' if stream == 'main' else '2'}"
-        elif profile == "dahua":
+        elif legacy_profile == "dahua":
             source_type, protocol = "camera", "rtsp"
             stream_path = stream_path or f"/cam/realmonitor?channel={channel}&subtype={'0' if stream == 'main' else '1'}"
-        elif profile == "axis":
+        elif legacy_profile == "axis":
             source_type, protocol = "camera", "rtsp"
             stream_path = stream_path or "/axis-media/media.amp"
-        elif profile == "custom_rtsp":
+        elif legacy_profile == "custom_rtsp":
             source_type, protocol = "camera", "rtsp"
-        elif profile == "http_mjpeg":
+        elif legacy_profile == "http_mjpeg":
             source_type, protocol = "camera", "http"
-            port = int(body.get("port") or 80)
-        elif profile == "https_mjpeg":
+        elif legacy_profile == "https_mjpeg":
             source_type, protocol = "camera", "https"
-            port = int(body.get("port") or 443)
         else:
             return jsonify(error="Choose a supported camera profile."), 400
     elif source_type in ("nvr", "camera"):
+        profile_id = "unv_nvr" if source_type == "nvr" else "unv_camera"
+        profile_name = "UNV · NVR channel" if source_type == "nvr" else "UNV · Direct camera"
         protocol = "rtsp"
         stream_path = (f"/unicast/c{channel}/s{'0' if stream == 'main' else '1'}/live" if source_type == "nvr"
                        else f"/media/video{'1' if stream == 'main' else '2'}")
@@ -402,14 +501,15 @@ def save_camera_stream():
         except (URLError, TimeoutError, OSError):
             return jsonify(error="The app cannot reach the go2rtc API at go2rtc:1984. Check Docker service networking and confirm go2rtc is running."), 503
         item = {"assetTag": asset_tag, "room": room, "hub": hub, "channel": channel, "stream": stream,
-                "sourceType": source_type, "profile": profile or ("unv_nvr" if source_type == "nvr" else "unv_camera"),
+                "sourceType": source_type, "profile": profile_id or legacy_profile or ("unv_nvr" if source_type == "nvr" else "unv_camera"),
+                "profileId": profile_id, "profileName": profile_name,
                 "protocol": protocol.upper(), "streamName": stream_name, "ip": camera_ip.compressed,
                 "rtspReachable": rtsp_reachable,
                 "encryptedSource": camera_secret_box().encrypt(source.encode()).decode()}
         items.append(item)
         conn.execute("INSERT INTO app_state(key,value) VALUES('camera_streams',%s::jsonb) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=now()",
                      (json.dumps(items),))
-    return jsonify(ok=True, rtspReachable=rtsp_reachable, item={k: item[k] for k in ("assetTag", "room", "hub", "channel", "stream", "streamName", "sourceType", "profile", "protocol", "ip", "rtspReachable")}), 201
+    return jsonify(ok=True, rtspReachable=rtsp_reachable, item={k: item[k] for k in ("assetTag", "room", "hub", "channel", "stream", "streamName", "sourceType", "profile", "profileId", "profileName", "protocol", "ip", "rtspReachable")}), 201
 
 
 @app.delete("/api/admin/camera-streams/<asset_tag>")
