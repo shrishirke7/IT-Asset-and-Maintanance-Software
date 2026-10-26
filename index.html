@@ -214,7 +214,7 @@ const assetForm=document.getElementById('assetForm'),deviceType=assetForm.elemen
  function assetCategoryCode(){let type=deviceType.value,sub=networkSubtype.value;if(type==='Desktop')return'DP';if(type==='Laptop')return'LP';if(type==='Printer')return'PR';if(type==='Server')return'SV';if(type==='Mobile')return'MO';if(type==='Tablet')return'TB';if(type==='Network')return({Switch:'NS',Router:'NR','Access point':'AP',Firewall:'FW'}[sub]||'NS');return''}
  window.assetCategoryCode=assetCategoryCode;
 function nextAssetTag(){let code=assetCategoryCode();if(!code)return'';let used=new Set(assets.map(a=>String(a.tag||'').toUpperCase()));for(let tries=0;tries<1000;tries++){let n=crypto.getRandomValues(new Uint32Array(1))[0]%1000000,tag='SS-'+code+'-'+String(n).padStart(6,'0');if(!used.has(tag))return tag}throw new Error('Could not generate a unique asset tag. Try again.')}
-function refreshGeneratedAssetTag(){if(assetEditIndex>=0)return;let field=assetForm.elements.namedItem('tag');field.value=assetCategoryCode()?nextAssetTag():''}
+function refreshGeneratedAssetTag(){let field=assetForm.elements.namedItem('tag');if(assetEditIndex>=0&&field.value.trim())return;field.value=assetCategoryCode()?nextAssetTag():''}
 window.refreshGeneratedAssetTag=refreshGeneratedAssetTag;
 deviceType.addEventListener('change',refreshGeneratedAssetTag);networkSubtype.addEventListener('change',refreshGeneratedAssetTag);
 const oldSpecsField=legacySpecs.closest('.field');oldSpecsField.style.display='none';oldSpecsField.insertAdjacentHTML('afterend','<div class="field full"><label>Category-specific specifications (optional)</label><div id="assetSpecFields" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px"></div></div>');

@@ -2,7 +2,7 @@
   const feeds=[];
   let feedRequest=null, player=null;
   const $=id=>document.getElementById(id);
-  const cameras=()=>assets.filter(a=>a.tag&&String(a.tag).trim()&&a.type==='Surveillance'&&(a.subtype||'CCTV')==='CCTV');
+  const cameras=()=>assets.filter(a=>String(a.tag||'').trim()&&['surveillance','cctv'].includes(String(a.type||'').trim().toLowerCase())&&String(a.subtype||a.subCategory||'cctv').trim().toLowerCase()==='cctv');
   function installStyles(){
     if($('cctvLiveStyles'))return;
     const style=document.createElement('style');style.id='cctvLiveStyles';style.textContent=`
@@ -46,7 +46,7 @@
   function openSetup(){
     if(!serverMode)return showToast('Live feeds require the installed server deployment.');if(!serverAdmin)return showToast('Administrator access is required to configure cameras.');
     const form=$('cctvSetupForm'),select=form.elements.namedItem('assetTag'),configured=new Set(feeds.map(f=>f.assetTag));select.innerHTML='<option value="">Select CCTV asset</option>'+cameras().filter(a=>!configured.has(a.tag)).map(a=>'<option value="'+esc(a.tag)+'">'+esc(a.name)+' · '+esc(a.tag)+'</option>').join('');
-    if(select.options.length<2)return showToast('Add an unconfigured CCTV asset in Asset inventory first.');form.reset();form.elements.namedItem('port').value=554;form.elements.namedItem('channel').value=1;$('cctvSetupStatus').textContent='';$('cctvSetupDialog').showModal();
+    if(select.options.length<2){const valid=cameras().length;return showToast(valid?'Every tagged CCTV asset already has a live-feed setup. Use another CCTV asset or remove its existing setup.':'No saved CCTV asset with a tag found. Edit the CCTV asset in Asset inventory and save it to generate a tag.')}form.reset();form.elements.namedItem('port').value=554;form.elements.namedItem('channel').value=1;$('cctvSetupStatus').textContent='';$('cctvSetupDialog').showModal();
   }
   async function saveSetup(e){
     e.preventDefault();const form=e.currentTarget,data=Object.fromEntries(new FormData(form));$('cctvSetupStatus').textContent='Saving encrypted camera setup…';const button=form.querySelector('[type=submit]');button.disabled=true;
