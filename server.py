@@ -11,10 +11,15 @@ import threading
 import unicodedata
 import shutil
 import tempfile
+import base64
+import socket
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from urllib.parse import quote
+from urllib.request import Request as URLRequest, urlopen
+from urllib.error import URLError, HTTPError
+from cryptography.fernet import Fernet, InvalidToken
 
 import psycopg
 from flask import Flask, abort, jsonify, redirect, request, send_from_directory, session
@@ -63,6 +68,20 @@ def db():
     return psycopg.connect(DATABASE_URL, connect_timeout=8)
 
 
+def camera_secret_box():
+    key = base64.urlsafe_b64encode(hashlib.sha256((APP_SECRET + "|camera-streams-v1").encode()).digest())
+    return Fernet(key)
+
+
+def go2rtc_request(method, path, params=None):
+    from urllib.parse import urlencode
+    base = os.getenv("GO2RTC_API", "http://go2rtc:1984").rstrip("/")
+    url = base + path + (("?" + urlencode(params)) if params else "")
+    req = URLRequest(url, method=method)
+    with urlopen(req, timeout=8) as response:
+        response.read(2048)
+
+
 def normalize_recovery_answer(value):
     return " ".join(unicodedata.normalize("NFKC", str(value or "")).casefold().split())
 
@@ -89,7 +108,7 @@ def init_db():
         for statement in schema.split(";"):
             if statement.strip():
                 conn.execute(statement)
-        conn.execute("INSERT INTO app_state(key,value) VALUES('assets','[]'),('software','[]'),('departments','[]'),('maintenance','[]'),('parts_catalog','[]'),('parts_inventory','[]'),('parts_stock_entries','[]'),('parts_assignments','[]'),('manual_users','[]'),('network_ranges','[]'),('network_scan','{}'),('scanner_heartbeat','{}'),('scanner_ip_status','{}'),('settings','{}'),('profile_preferences','{}'),('notifications','{\"rules\":[],\"queue\":[]}') ON CONFLICT(key) DO NOTHING")
+        conn.execute("INSERT INTO app_state(key,value) VALUES('assets','[]'),('software','[]'),('departments','[]'),('maintenance','[]'),('parts_catalog','[]'),('parts_inventory','[]'),('parts_stock_entries','[]'),('parts_assignments','[]'),('manual_users','[]'),('camera_streams','[]'),('network_ranges','[]'),('network_scan','{}'),('scanner_heartbeat','{}'),('scanner_ip_status','{}'),('settings','{}'),('profile_preferences','{}'),('notifications','{\"rules\":[],\"queue\":[]}') ON CONFLICT(key) DO NOTHING")
 
 
 def signed_in(fn):
@@ -160,6 +179,11 @@ def add_security_headers(response):
     if request.path in ("/", "/setup", "/api/login", "/api/recovery/reset", "/api/account/recovery-answers"):
         response.headers["Cache-Control"] = "no-store"
     return response
+
+
+@app.get("/cctv-live.js")
+def cctv_live_script():
+    return send_from_directory(ROOT, "cctv-live.js")
 
 
 @app.get("/")
@@ -243,6 +267,116 @@ def profile_media(filename):
     if Path(filename).name != filename or Path(filename).suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
         abort(404)
     return send_from_directory(PROFILE_MEDIA_DIR, filename, max_age=3600)
+
+
+@app.get("/api/cctv-media-auth")
+@signed_in
+def cctv_media_auth():
+    if request.headers.get("X-Original-Method") != "POST":
+        abort(403)
+    origin = request.headers.get("X-Original-Origin", "").rstrip("/")
+    if origin != request.host_url.rstrip("/"):
+        abort(403)
+    return "", 204
+
+
+@app.get("/api/camera-streams")
+@signed_in
+def get_camera_streams():
+    with db() as conn:
+        row = conn.execute("SELECT value FROM app_state WHERE key='camera_streams'").fetchone()
+    items = row[0] if row else []
+    # go2rtc streams are runtime entries. Recreate them from the encrypted
+    # database after a container restart before returning the list to viewers.
+    for item in items:
+        try:
+            source = camera_secret_box().decrypt(item["encryptedSource"].encode()).decode()
+            go2rtc_request("PUT", "/api/streams", {"name": item["streamName"], "src": source})
+            item["gatewayReady"] = True
+        except (KeyError, ValueError, InvalidToken, URLError, HTTPError, TimeoutError, OSError):
+            item["gatewayReady"] = False
+    public = [{k: item.get(k, "") for k in ("assetTag", "room", "hub", "channel", "stream", "streamName", "sourceType", "ip", "rtspReachable")}
+              for item in items if isinstance(item, dict)]
+    for item, safe in zip((x for x in items if isinstance(x, dict)), public):
+        safe["gatewayReady"] = bool(item.get("gatewayReady"))
+    return jsonify(items=public)
+
+
+@app.post("/api/admin/camera-streams")
+@administrator
+def save_camera_stream():
+    body = request.get_json(force=True)
+    asset_tag = str(body.get("assetTag", "")).strip()[:80]
+    room = str(body.get("room", "")).strip()[:100]
+    hub = str(body.get("hub", "")).strip()[:100]
+    source_type = str(body.get("sourceType", "nvr")).lower()
+    stream = str(body.get("stream", "main")).lower()
+    username = str(body.get("username", "")).strip()[:128]
+    password = str(body.get("password", ""))[:256]
+    try:
+        channel = int(body.get("channel", 1))
+        port = int(body.get("port", 554))
+        camera_ip = ipaddress.ip_address(str(body.get("ip", "")).strip())
+    except (ValueError, TypeError):
+        return jsonify(error="Enter a valid private camera/NVR IP, RTSP port, and channel."), 400
+    if camera_ip.is_global or camera_ip.is_multicast or camera_ip.is_unspecified or camera_ip.is_loopback or camera_ip.is_link_local or camera_ip.is_reserved:
+        return jsonify(error="Use the camera/NVR's private VLAN IP address."), 400
+    if not asset_tag or not room or not hub or not username or not password:
+        return jsonify(error="Choose a registered CCTV asset and enter room, hub, username, and password."), 400
+    if source_type not in ("nvr", "camera") or stream not in ("main", "sub") or not 1 <= channel <= 256 or port not in (554, 8554):
+        return jsonify(error="Use RTSP port 554 (or 8554 if your UNV device was configured for it), and check the source, channel, and stream type."), 400
+    rtsp_reachable = False
+    try:
+        with socket.create_connection((str(camera_ip), port), timeout=2):
+            rtsp_reachable = True
+    except OSError:
+        pass
+    with db() as conn:
+        assets_row = conn.execute("SELECT value FROM app_state WHERE key='assets'").fetchone()
+        items_row = conn.execute("SELECT value FROM app_state WHERE key='camera_streams' FOR UPDATE").fetchone()
+        assets = assets_row[0] if assets_row else []
+        if not any(str(a.get("tag", "")) == asset_tag and str(a.get("type", "")).casefold() == "surveillance"
+                   and str(a.get("subtype", a.get("subCategory", "CCTV"))).casefold() == "cctv" for a in assets):
+            return jsonify(error="Select a registered CCTV asset first."), 400
+        items = items_row[0] if items_row else []
+        if any(item.get("assetTag") == asset_tag for item in items):
+            return jsonify(error="This CCTV asset already has a live-feed setup. Remove it before adding it again."), 409
+        stream_name = "cam_" + hmac.new(APP_SECRET.encode(), asset_tag.encode(), hashlib.sha256).hexdigest()[:24]
+        host = f"[{camera_ip.compressed}]" if camera_ip.version == 6 else camera_ip.compressed
+        path = (f"/unicast/c{channel}/s{'0' if stream == 'main' else '1'}/live" if source_type == "nvr"
+                else f"/media/video{'1' if stream == 'main' else '2'}")
+        source = f"rtsp://{quote(username, safe='')}:{quote(password, safe='')}@{host}:{port}{path}"
+        try:
+            go2rtc_request("PUT", "/api/streams", {"name": stream_name, "src": source})
+        except (URLError, HTTPError, TimeoutError, OSError):
+            return jsonify(error="Live-video gateway is unavailable. Confirm the go2rtc service is running."), 503
+        item = {"assetTag": asset_tag, "room": room, "hub": hub, "channel": channel, "stream": stream,
+                "sourceType": source_type, "streamName": stream_name, "ip": camera_ip.compressed,
+                "rtspReachable": rtsp_reachable,
+                "encryptedSource": camera_secret_box().encrypt(source.encode()).decode()}
+        items.append(item)
+        conn.execute("INSERT INTO app_state(key,value) VALUES('camera_streams',%s::jsonb) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=now()",
+                     (json.dumps(items),))
+    return jsonify(ok=True, rtspReachable=rtsp_reachable, item={k: item[k] for k in ("assetTag", "room", "hub", "channel", "stream", "streamName", "sourceType", "ip", "rtspReachable")}), 201
+
+
+@app.delete("/api/admin/camera-streams/<asset_tag>")
+@administrator
+def delete_camera_stream(asset_tag):
+    asset_tag = str(asset_tag).strip()[:80]
+    with db() as conn:
+        row = conn.execute("SELECT value FROM app_state WHERE key='camera_streams' FOR UPDATE").fetchone()
+        items = row[0] if row else []
+        item = next((entry for entry in items if entry.get("assetTag") == asset_tag), None)
+        if not item:
+            return jsonify(error="Live-feed setup was not found."), 404
+        try:
+            go2rtc_request("DELETE", "/api/streams", {"src": item["streamName"]})
+        except (URLError, HTTPError, TimeoutError, OSError):
+            return jsonify(error="Could not remove the stream from go2rtc. Keep this setup and retry when the gateway is online."), 503
+        items = [entry for entry in items if entry.get("assetTag") != asset_tag]
+        conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='camera_streams'", (json.dumps(items),))
+    return jsonify(ok=True)
 
 @app.get("/login-media/<path:filename>")
 def login_media(filename):
@@ -1570,7 +1704,7 @@ def restore_uploaded_backup():
 
 @app.errorhandler(413)
 def too_large(_):
-    limit = "1 GB" if request.path == "/api/backups/restore" else "12 MB"
+    limit = "1 GB" if request.path == "/api/backups/restore" else "64 MB"
     return jsonify(error=f"Request too large (maximum {limit})"), 413
 
 

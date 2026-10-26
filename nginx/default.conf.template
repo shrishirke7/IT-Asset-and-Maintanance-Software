@@ -23,6 +23,29 @@ server {
     add_header Referrer-Policy no-referrer always;
     add_header X-Frame-Options DENY always;
 
+    location = /_cctv_auth {
+        internal;
+        proxy_pass http://app:8000/api/cctv-media-auth;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header Cookie $http_cookie;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Original-Method $request_method;
+        proxy_set_header X-Original-Origin $http_origin;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
+    # Only the browser WebRTC endpoint is proxied; go2rtc administration stays private.
+    location = /cctv/api/webrtc {
+        auth_request /_cctv_auth;
+        proxy_pass http://go2rtc:1984/api/webrtc;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+    }
+
     location / {
         proxy_pass http://app:8000;
         proxy_http_version 1.1;
