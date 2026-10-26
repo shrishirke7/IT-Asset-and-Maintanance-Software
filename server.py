@@ -297,7 +297,7 @@ def profile_media(filename):
 @app.get("/api/cctv-media-auth")
 @signed_in
 def cctv_media_auth():
-    if request.headers.get("X-Original-Method") != "POST":
+    if request.headers.get("X-Original-Method") not in ("POST", "GET"):
         abort(403)
     origin = request.headers.get("X-Original-Origin", "").rstrip("/")
     if origin != request.host_url.rstrip("/"):
