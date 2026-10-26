@@ -2,7 +2,7 @@
   const feeds=[];
   let feedRequest=null, player=null;
   const $=id=>document.getElementById(id);
-  const cameras=()=>assets.filter(a=>a.type==='Surveillance'&&(a.subtype||'CCTV')==='CCTV');
+  const cameras=()=>assets.filter(a=>a.tag&&String(a.tag).trim()&&a.type==='Surveillance'&&(a.subtype||'CCTV')==='CCTV');
   function installStyles(){
     if($('cctvLiveStyles'))return;
     const style=document.createElement('style');style.id='cctvLiveStyles';style.textContent=`

@@ -321,8 +321,10 @@ def save_camera_stream():
         return jsonify(error="Enter a valid private camera/NVR IP, RTSP port, and channel."), 400
     if camera_ip.is_global or camera_ip.is_multicast or camera_ip.is_unspecified or camera_ip.is_loopback or camera_ip.is_link_local or camera_ip.is_reserved:
         return jsonify(error="Use the camera/NVR's private VLAN IP address."), 400
-    if not asset_tag or not room or not hub or not username or not password:
-        return jsonify(error="Choose a registered CCTV asset and enter room, hub, username, and password."), 400
+    if not asset_tag:
+        return jsonify(error="Select a saved CCTV asset with an asset tag. Register this device as Surveillance → CCTV first."), 400
+    if not room or not hub or not username or not password:
+        return jsonify(error="Enter the hub, room, camera username, and camera password."), 400
     if source_type not in ("nvr", "camera") or stream not in ("main", "sub") or not 1 <= channel <= 256 or port not in (554, 8554):
         return jsonify(error="Use RTSP port 554 (or 8554 if your UNV device was configured for it), and check the source, channel, and stream type."), 400
     rtsp_reachable = False
