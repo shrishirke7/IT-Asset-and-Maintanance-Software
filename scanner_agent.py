@@ -114,7 +114,7 @@ def run_task(task):
                 if row:
                     results.append(row)
                 progress += 1
-                if progress % 32 == 0 or progress == len(hosts):
+                if progress % 512 == 0 or progress == len(hosts):
                     results.sort(key=lambda row:tuple(int(part) for part in row["ip"].split(".")))
                     request_json("/api/internal/scanner-progress", {"id":scan_id, "status":"running", "progress":progress, "results":results}, timeout=10)
         results.sort(key=lambda row:tuple(int(part) for part in row["ip"].split(".")))

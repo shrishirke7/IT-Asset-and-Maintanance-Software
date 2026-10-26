@@ -642,8 +642,8 @@ def network_scans():
 def save_network_scan_ranges():
     body = request.get_json(force=True)
     raw = body.get("ranges", [])
-    if not isinstance(raw, list) or len(raw) > 16:
-        return jsonify(error="Enter up to 16 private IPv4 network ranges"), 400
+    if not isinstance(raw, list) or len(raw) > 25000:
+        return jsonify(error="Enter up to 25,000 private IPv4 CIDR ranges"), 400
     networks = []
     for value in raw:
         try:
@@ -654,8 +654,6 @@ def save_network_scan_ranges():
             return jsonify(error="Only private IPv4 ranges up to /24 can be scanned"), 400
         if network not in networks:
             networks.append(network)
-    if sum(len(list(n.hosts())) for n in networks) > 1024:
-        return jsonify(error="Combined scan limit is 1,024 addresses"), 400
     values = [str(n) for n in networks]
     with db() as conn:
         conn.execute("INSERT INTO app_state(key,value) VALUES('network_ranges',%s::jsonb) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=now()", (json.dumps(values),))
@@ -672,9 +670,9 @@ def start_network_scan():
     if not raw:
         return jsonify(error="Add the authorized private network ranges to scan first"), 400
     networks = [ipaddress.ip_network(value, strict=True) for value in raw]
-    hosts_count = sum(len(list(n.hosts())) for n in networks)
-    if hosts_count > 1024:
-        return jsonify(error="Combined scan limit is 1,024 addresses"), 400
+    hosts_count = sum(n.num_addresses - (2 if n.prefixlen < 31 else 0) for n in networks)
+    if hosts_count > 25000:
+        return jsonify(error="Combined scan limit is 25,000 addresses. CIDR ranges can be /24 or smaller."), 400
     with db() as conn:
         current = conn.execute("SELECT value FROM app_state WHERE key='network_scan' FOR UPDATE").fetchone()
         prior = current[0] if current else {}
@@ -919,7 +917,7 @@ def scanner_ip_status_results():
     task_id = str(body.get("id", ""))
     responsive = set()
     rows = body.get("online", [])
-    if not task_id or not isinstance(rows, list) or len(rows) > 1024:
+    if not task_id or not isinstance(rows, list) or len(rows) > 25000:
         return jsonify(error="Invalid IP status result"), 400
     for value in rows:
         try:
@@ -1048,11 +1046,11 @@ def scanner_progress():
     if not scan_id or status not in ("running", "completed", "failed"):
         return jsonify(error="Invalid scanner progress update"), 400
     try:
-        progress = max(0, min(1024, int(body.get("progress", 0))))
+        progress = max(0, min(25000, int(body.get("progress", 0))))
     except (ValueError, TypeError):
         return jsonify(error="Invalid scan progress"), 400
     results = body.get("results", [])
-    if not isinstance(results, list) or len(results) > 1024:
+    if not isinstance(results, list) or len(results) > 25000:
         return jsonify(error="Invalid scan results"), 400
     clean = []
     for item in results:
