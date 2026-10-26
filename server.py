@@ -350,8 +350,13 @@ def save_camera_stream():
         source = f"rtsp://{quote(username, safe='')}:{quote(password, safe='')}@{host}:{port}{path}"
         try:
             go2rtc_request("PUT", "/api/streams", {"name": stream_name, "src": source})
-        except (URLError, HTTPError, TimeoutError, OSError):
-            return jsonify(error="Live-video gateway is unavailable. Confirm the go2rtc service is running."), 503
+        except HTTPError as exc:
+            # Keep the gateway response body private: it may echo the RTSP source URL,
+            # which contains the camera credentials. The status code is safe and
+            # distinguishes a reachable API rejecting the request from a network failure.
+            return jsonify(error=f"The live-video gateway responded with HTTP {exc.code}. Check the go2rtc logs for the stream setup error."), 502
+        except (URLError, TimeoutError, OSError):
+            return jsonify(error="The app cannot reach the go2rtc API at go2rtc:1984. Check Docker service networking and confirm go2rtc is running."), 503
         item = {"assetTag": asset_tag, "room": room, "hub": hub, "channel": channel, "stream": stream,
                 "sourceType": source_type, "streamName": stream_name, "ip": camera_ip.compressed,
                 "rtspReachable": rtsp_reachable,
