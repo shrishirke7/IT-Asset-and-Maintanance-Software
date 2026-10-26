@@ -377,13 +377,24 @@ def get_camera_streams():
     items = row[0] if row else []
     # go2rtc streams are runtime entries. Recreate them from the encrypted
     # database after a container restart before returning the list to viewers.
+    # Browser WebRTC cannot receive H.265 in common browsers. Route camera RTSP
+    # through go2rtc's bundled FFmpeg H.264 transcoder for a compatible live feed.
+    migrated = False
     for item in items:
         try:
             source = camera_secret_box().decrypt(item["encryptedSource"].encode()).decode()
+            if not source.startswith("ffmpeg:"):
+                source = f"ffmpeg:{source}#video=h264"
+                item["encryptedSource"] = camera_secret_box().encrypt(source.encode()).decode()
+                migrated = True
             go2rtc_request("PUT", "/api/streams", {"name": item["streamName"], "src": source})
             item["gatewayReady"] = True
         except (KeyError, ValueError, InvalidToken, URLError, HTTPError, TimeoutError, OSError):
             item["gatewayReady"] = False
+    if migrated:
+        with db() as conn:
+            conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='camera_streams'",
+                         (json.dumps(items),))
     public = [{k: item.get(k, "") for k in ("assetTag", "room", "hub", "channel", "stream", "streamName", "sourceType", "profile", "profileId", "profileName", "protocol", "ip", "rtspReachable")}
               for item in items if isinstance(item, dict)]
     for item, safe in zip((x for x in items if isinstance(x, dict)), public):
