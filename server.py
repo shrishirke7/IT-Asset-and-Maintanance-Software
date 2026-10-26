@@ -54,6 +54,8 @@ LOGIN_MEDIA_DIR = UPLOAD_DIR / "login-branding"
 LOGIN_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 PROFILE_MEDIA_DIR = UPLOAD_DIR / 'profiles'
 PROFILE_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+FONT_UPLOAD_DIR = UPLOAD_DIR / "fonts"
+FONT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 APP_SECRET = os.getenv("APP_SECRET", "")
 if len(APP_SECRET) < 40:
     raise RuntimeError("APP_SECRET must be a randomly generated secret of at least 40 characters")
@@ -540,6 +542,42 @@ def login_media(filename):
     if Path(filename).name != filename or Path(filename).suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
         abort(404)
     return send_from_directory(LOGIN_MEDIA_DIR, filename, max_age=3600)
+
+
+@app.post("/api/admin/fonts")
+@administrator
+def upload_custom_font():
+    upload = request.files.get("font")
+    if not upload or not upload.filename:
+        return jsonify(error="Choose a font file to upload."), 400
+    ext = Path(secure_filename(upload.filename)).suffix.lower()
+    signatures = {
+        ".woff2": (b"wOF2", "font/woff2", "woff2"),
+        ".woff": (b"wOFF", "font/woff", "woff"),
+        ".ttf": (b"\x00\x01\x00\x00", "font/ttf", "truetype"),
+        ".otf": (b"OTTO", "font/otf", "opentype"),
+    }
+    if ext not in signatures:
+        return jsonify(error="Use a WOFF2, WOFF, TTF, or OTF font file."), 400
+    data = upload.stream.read(5 * 1024 * 1024 + 1)
+    if not data or len(data) > 5 * 1024 * 1024:
+        return jsonify(error="Font files must be no larger than 5 MB."), 400
+    signature, _, _ = signatures[ext]
+    if not data.startswith(signature):
+        return jsonify(error="The file contents do not match the selected font type."), 400
+    filename = uuid.uuid4().hex + ext
+    (FONT_UPLOAD_DIR / filename).write_bytes(data)
+    return jsonify(name=secure_filename(upload.filename)[:120] or "Custom font", url="/api/custom-fonts/" + filename, format=signatures[ext][2]), 201
+
+
+@app.get("/api/custom-fonts/<path:filename>")
+def custom_font_file(filename):
+    if Path(filename).name != filename or not re.fullmatch(r"[a-f0-9]{32}\.(?:woff2|woff|ttf|otf)", filename):
+        abort(404)
+    mime = {".woff2": "font/woff2", ".woff": "font/woff", ".ttf": "font/ttf", ".otf": "font/otf"}[Path(filename).suffix]
+    response = send_from_directory(FONT_UPLOAD_DIR, filename, mimetype=mime, max_age=3600)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 
 def save_login_image(upload):
