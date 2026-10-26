@@ -19,6 +19,7 @@ import urllib.request
 BASE_URL = os.getenv("SCANNER_URL", "http://127.0.0.1:8000").rstrip("/")
 TOKEN = os.getenv("APP_SECRET", "")
 POLL_SECONDS = 2
+SNMP_COUNTERS = {}
 
 
 def request_json(path, payload=None, timeout=5):
@@ -144,6 +145,87 @@ def run_ip_status_task(task):
         print(f"IP status check failed: {type(exc).__name__}", flush=True)
 
 
+def _snmp_walk(profile, oid):
+    command = [
+        "snmpwalk", "-On", "-t", "3", "-r", "0", "-v3", "-l", "authPriv",
+        "-u", str(profile["username"]), "-a", str(profile["authProtocol"]), "-A", str(profile["authSecret"]),
+        "-x", str(profile["privacyProtocol"]), "-X", str(profile["privacySecret"]),
+        f"udp:{profile['host']}:{int(profile.get('port', 161))}", oid,
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=8, check=False)
+    if result.returncode != 0:
+        raise RuntimeError("SNMP query failed; check route, SNMPv3 credentials and UDP 161 access")
+    return result.stdout
+
+
+def _snmp_table_values(output, table_oid, numeric=False):
+    values = {}
+    prefix = "." + table_oid.lstrip(".") + "."
+    for line in output.splitlines():
+        left, sep, right = line.partition("=")
+        left = left.strip()
+        if not sep or not left.startswith(prefix):
+            continue
+        suffix = left[len(prefix):].split(".", 1)[0]
+        if not suffix.isdigit():
+            continue
+        value = right.strip().split(":", 1)[-1].strip()
+        value = value.strip('"')
+        if numeric:
+            match = re.search(r"\d+", value)
+            if not match:
+                continue
+            value = int(match.group(0))
+        values[int(suffix)] = value
+    return values
+
+
+def poll_snmp_profile(profile):
+    profile_id = str(profile.get("id", ""))
+    try:
+        names = _snmp_table_values(_snmp_walk(profile, ".1.3.6.1.2.1.31.1.1.1.1"), ".1.3.6.1.2.1.31.1.1.1.1")
+        if not names:
+            names = _snmp_table_values(_snmp_walk(profile, ".1.3.6.1.2.1.2.2.1.2"), ".1.3.6.1.2.1.2.2.1.2")
+        incoming = _snmp_table_values(_snmp_walk(profile, ".1.3.6.1.2.1.31.1.1.1.6"), ".1.3.6.1.2.1.31.1.1.1.6", True)
+        outgoing = _snmp_table_values(_snmp_walk(profile, ".1.3.6.1.2.1.31.1.1.1.10"), ".1.3.6.1.2.1.31.1.1.1.10", True)
+        counter_bits = 64
+        if not incoming or not outgoing:
+            incoming = _snmp_table_values(_snmp_walk(profile, ".1.3.6.1.2.1.2.2.1.10"), ".1.3.6.1.2.1.2.2.1.10", True)
+            outgoing = _snmp_table_values(_snmp_walk(profile, ".1.3.6.1.2.1.2.2.1.16"), ".1.3.6.1.2.1.2.2.1.16", True)
+            counter_bits = 32
+        if not names or not incoming or not outgoing:
+            raise RuntimeError("No IF-MIB interface counters returned; check SNMP permissions and supported OIDs")
+        selected = str(profile.get("interfaceIndex", "")).strip()
+        now = time.monotonic()
+        current = {i: (incoming[i], outgoing[i]) for i in incoming.keys() & outgoing.keys()
+                   if not selected or str(i) == selected}
+        previous = SNMP_COUNTERS.get(profile_id, {})
+        elapsed = max(0.1, now - previous.get("at", now))
+        samples = []
+        for index, (rx, tx) in current.items():
+            old = previous.get("values", {}).get(index)
+            if old:
+                rx_delta, tx_delta = rx - old[0], tx - old[1]
+                if previous.get("bits") == 32 and counter_bits == 32:
+                    if rx_delta < 0 and old[0] > 0xF0000000:
+                        rx_delta += 1 << 32
+                    if tx_delta < 0 and old[1] > 0xF0000000:
+                        tx_delta += 1 << 32
+                # A counter reset/reboot starts a new baseline; never publish a negative rate.
+                if rx_delta >= 0 and tx_delta >= 0:
+                    samples.append({"interfaceIndex": index, "interfaceName": str(names.get(index, f"if{index}")),
+                                    "rxBps": round(rx_delta * 8 / elapsed, 2),
+                                    "txBps": round(tx_delta * 8 / elapsed, 2)})
+        SNMP_COUNTERS[profile_id] = {"at": now, "values": current, "bits": counter_bits}
+        request_json("/api/internal/snmp-results", {"id": profile_id, "ok": True, "samples": samples}, timeout=10)
+        print(f"SNMP poll {profile.get('name', profile_id)}: {len(current)} interfaces", flush=True)
+    except Exception as exc:
+        SNMP_COUNTERS.pop(profile_id, None)
+        request_json("/api/internal/snmp-results", {"id": profile_id, "ok": False,
+                     "error": str(exc)[:180], "samples": []}, timeout=10)
+        print(f"SNMP poll {profile_id} failed: {type(exc).__name__}", flush=True)
+
+
 def send_notification(job):
     channel = job.get("channel")
     status = str(job.get("status", ""))
@@ -246,6 +328,13 @@ def main():
             notification = request_json("/api/internal/notification-task", timeout=5)
             if notification:
                 run_notification_task(notification)
+            snmp_task = request_json("/api/internal/snmp-task", timeout=5)
+            if snmp_task:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                    futures = [pool.submit(poll_snmp_profile, profile) for profile in snmp_task.get("items", [])]
+                    for future in concurrent.futures.as_completed(futures):
+                        future.result()
+                continue
             task = request_json("/api/internal/scanner-task", timeout=5)
             if task:
                 print(f"Starting authorized scan {task['id']} over {task.get('total', 0)} addresses", flush=True)

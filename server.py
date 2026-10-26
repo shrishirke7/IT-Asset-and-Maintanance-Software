@@ -91,6 +91,11 @@ def camera_secret_box():
     return Fernet(key)
 
 
+def snmp_secret_box():
+    key = base64.urlsafe_b64encode(hashlib.sha256((APP_SECRET + "|snmp-monitors-v1").encode()).digest())
+    return Fernet(key)
+
+
 def go2rtc_request(method, path, params=None):
     from urllib.parse import urlencode
     base = os.getenv("GO2RTC_API", "http://go2rtc:1984").rstrip("/")
@@ -692,6 +697,185 @@ def start_network_scan():
 def _scanner_authorized():
     supplied = request.headers.get("X-Northstar-Scanner", "")
     return bool(supplied) and secrets.compare_digest(supplied, APP_SECRET)
+
+
+def _snmp_rows(conn):
+    row = conn.execute("SELECT value FROM app_state WHERE key='snmp_monitors'").fetchone()
+    value = row[0] if row else []
+    return value if isinstance(value, list) else []
+
+
+@app.get("/api/admin/snmp-monitors")
+@administrator
+def get_snmp_monitors():
+    with db() as conn:
+        monitors = _snmp_rows(conn)
+        samples_row = conn.execute("SELECT value FROM app_state WHERE key='snmp_samples'").fetchone()
+    samples = samples_row[0] if samples_row else []
+    clean = [{k: v for k, v in item.items() if k not in ("authSecret", "privacySecret")} | {
+        "hasAuthSecret": bool(item.get("authSecret")), "hasPrivacySecret": bool(item.get("privacySecret"))
+    } for item in monitors]
+    return jsonify(items=clean, samples=samples if isinstance(samples, list) else [])
+
+
+@app.put("/api/admin/snmp-monitors")
+@administrator
+def save_snmp_monitors():
+    body = request.get_json(force=True)
+    items = body.get("items") if isinstance(body, dict) else None
+    if not isinstance(items, list) or len(items) > 100:
+        return jsonify(error="Provide up to 100 SNMP monitor entries."), 400
+    with db() as conn:
+        old_rows = _snmp_rows(conn)
+        old_by_id = {str(item.get("id")): item for item in old_rows if isinstance(item, dict)}
+        clean, seen = [], set()
+        for item in items:
+            if not isinstance(item, dict):
+                return jsonify(error="Each SNMP monitor must be an object."), 400
+            monitor_id = str(item.get("id") or uuid.uuid4()).strip()[:40]
+            name = str(item.get("name", "")).strip()[:80]
+            host = str(item.get("host", "")).strip()
+            try:
+                ip = ipaddress.ip_address(host)
+                port = int(item.get("port", 161))
+                interval = int(item.get("pollSeconds", 60))
+                interface_index = str(item.get("interfaceIndex", "")).strip()
+            except (ValueError, TypeError):
+                return jsonify(error="Use a valid IP address, port, polling interval and interface index."), 400
+            if (not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", monitor_id) or monitor_id in seen
+                    or not name or ip.version != 4 or not ip.is_private or ip.is_multicast or ip.is_loopback
+                    or not 1 <= port <= 65535 or not 15 <= interval <= 600
+                    or (interface_index and (not interface_index.isdigit() or len(interface_index) > 8))):
+                return jsonify(error="Check the unique ID, name, private IPv4, port, 15–600 second interval and optional interface index."), 400
+            seen.add(monitor_id)
+            prior = old_by_id.get(monitor_id, {})
+            auth_protocol = str(item.get("authProtocol", "SHA")).upper()
+            privacy_protocol = str(item.get("privacyProtocol", "AES")).upper()
+            username = str(item.get("username", "")).strip()[:40]
+            auth_secret = str(item.get("authSecret", ""))
+            privacy_secret = str(item.get("privacySecret", ""))
+            if auth_protocol not in ("SHA", "SHA-256", "SHA-384", "SHA-512") or privacy_protocol not in ("AES", "AES-192", "AES-256"):
+                return jsonify(error="Choose a supported SNMPv3 authentication and AES privacy algorithm."), 400
+            if not username or len(username) > 40:
+                return jsonify(error="Enter the SNMPv3 username."), 400
+            if auth_secret:
+                if len(auth_secret) < 8 or len(auth_secret) > 128:
+                    return jsonify(error="SNMP authentication passphrases must be 8–128 characters."), 400
+                auth_secret = snmp_secret_box().encrypt(auth_secret.encode()).decode()
+            else:
+                auth_secret = prior.get("authSecret", "")
+            if privacy_secret:
+                if len(privacy_secret) < 8 or len(privacy_secret) > 128:
+                    return jsonify(error="SNMP privacy passphrases must be 8–128 characters."), 400
+                privacy_secret = snmp_secret_box().encrypt(privacy_secret.encode()).decode()
+            else:
+                privacy_secret = prior.get("privacySecret", "")
+            if not auth_secret or not privacy_secret:
+                return jsonify(error="Enter both SNMPv3 passphrases when adding a monitor."), 400
+            clean.append({"id": monitor_id, "name": name, "host": str(ip), "port": port,
+                          "pollSeconds": interval, "interfaceIndex": interface_index,
+                          "username": username, "authProtocol": auth_protocol,
+                          "privacyProtocol": privacy_protocol, "authSecret": auth_secret,
+                          "privacySecret": privacy_secret, "enabled": bool(item.get("enabled", True)),
+                          "lastPollAt": prior.get("lastPollAt", ""),
+                          "lastStatus": prior.get("lastStatus", "Not checked"),
+                          "lastError": prior.get("lastError", ""),
+                          "nextPollAt": prior.get("nextPollAt", "")})
+        conn.execute("INSERT INTO app_state(key,value) VALUES('snmp_monitors',%s::jsonb) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=now()", (json.dumps(clean),))
+    return jsonify(ok=True, items=[{k: v for k, v in item.items() if k not in ("authSecret", "privacySecret")} for item in clean])
+
+
+@app.get("/api/snmp-metrics")
+@signed_in
+def get_snmp_metrics():
+    with db() as conn:
+        profiles = _snmp_rows(conn)
+        row = conn.execute("SELECT value FROM app_state WHERE key='snmp_samples'").fetchone()
+    samples = row[0] if row else []
+    return jsonify(items=[{"id": p.get("id"), "name": p.get("name"), "host": p.get("host"),
+                           "enabled": p.get("enabled", True), "lastPollAt": p.get("lastPollAt", ""),
+                           "lastStatus": p.get("lastStatus", "Not checked"), "lastError": p.get("lastError", "")}
+                          for p in profiles], samples=samples if isinstance(samples, list) else [])
+
+
+@app.get("/api/internal/snmp-task")
+def snmp_task():
+    if not _scanner_authorized():
+        abort(403)
+    now = datetime.now(timezone.utc)
+    tasks = []
+    with db() as conn:
+        monitors = _snmp_rows(conn)
+        changed = False
+        for item in monitors:
+            if not item.get("enabled", True):
+                continue
+            try:
+                due = not item.get("nextPollAt") or datetime.fromisoformat(item["nextPollAt"]) <= now
+            except (ValueError, TypeError):
+                due = True
+            if not due:
+                continue
+            item["nextPollAt"] = (now + __import__("datetime").timedelta(seconds=int(item.get("pollSeconds", 60)))).isoformat()
+            try:
+                task = {k: v for k, v in item.items() if k not in ("authSecret", "privacySecret")}
+                task["authSecret"] = snmp_secret_box().decrypt(item["authSecret"].encode()).decode()
+                task["privacySecret"] = snmp_secret_box().decrypt(item["privacySecret"].encode()).decode()
+                tasks.append(task)
+            except (KeyError, InvalidToken, ValueError):
+                item["lastStatus"] = "Configuration error"
+                item["lastError"] = "Stored SNMP credentials could not be decrypted; re-save this profile."
+                changed = True
+        if changed or tasks:
+            conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='snmp_monitors'", (json.dumps(monitors),))
+    if not tasks:
+        return ("", 204)
+    return jsonify(items=tasks)
+
+
+@app.post("/api/internal/snmp-results")
+def snmp_results():
+    if not _scanner_authorized():
+        abort(403)
+    body = request.get_json(force=True)
+    profile_id = str(body.get("id", ""))[:40]
+    status = "Online" if body.get("ok") else "Error"
+    message = str(body.get("error", ""))[:180]
+    raw_samples = body.get("samples", [])
+    if not profile_id or not isinstance(raw_samples, list) or len(raw_samples) > 512:
+        return jsonify(error="Invalid SNMP metrics result."), 400
+    clean_samples = []
+    at = datetime.now(timezone.utc).isoformat()
+    for sample in raw_samples:
+        try:
+            index = int(sample.get("interfaceIndex"))
+            rx = max(0.0, min(1e13, float(sample.get("rxBps", 0))))
+            tx = max(0.0, min(1e13, float(sample.get("txBps", 0))))
+            clean_samples.append({"monitorId": profile_id, "interfaceIndex": index,
+                                  "interfaceName": str(sample.get("interfaceName", ""))[:80],
+                                  "rxBps": rx, "txBps": tx, "at": at})
+        except (ValueError, TypeError, AttributeError):
+            continue
+    with db() as conn:
+        profiles = _snmp_rows(conn)
+        profile = next((p for p in profiles if p.get("id") == profile_id), None)
+        if not profile:
+            return jsonify(error="SNMP monitor no longer exists."), 404
+        profile.update(lastPollAt=at, lastStatus=status, lastError=message)
+        conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='snmp_monitors'", (json.dumps(profiles),))
+        row = conn.execute("SELECT value FROM app_state WHERE key='snmp_samples' FOR UPDATE").fetchone()
+        samples = row[0] if row and isinstance(row[0], list) else []
+        samples.extend(clean_samples)
+        cutoff = now.timestamp() - 86400
+        retained = []
+        for sample in samples:
+            try:
+                if datetime.fromisoformat(sample.get("at", "")).timestamp() >= cutoff:
+                    retained.append(sample)
+            except (ValueError, TypeError):
+                continue
+        conn.execute("INSERT INTO app_state(key,value) VALUES('snmp_samples',%s::jsonb) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=now()", (json.dumps(retained[-20000:]),))
+    return jsonify(ok=True, accepted=len(clean_samples))
 
 
 def _notification_channel_status():
