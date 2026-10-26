@@ -1098,7 +1098,9 @@ def scanner_ip_status_task():
         if prior_time:
             try:
                 elapsed = (now - datetime.fromisoformat(prior_time)).total_seconds()
-                if (not state.get("finished_at") and elapsed < 120) or (state.get("finished_at") and elapsed < 30):
+                # Recheck known inventory endpoints frequently; the scanner only
+                # probes saved device IPs here (CIDR discovery is a separate task).
+                if (not state.get("finished_at") and elapsed < 120) or (state.get("finished_at") and elapsed < 5):
                     return ("", 204)
             except (ValueError, TypeError):
                 pass

@@ -65,6 +65,16 @@ def probe(ip):
         return None
 
 
+def ping_reachable(ip):
+    """Fast status-only probe; avoid DNS and neighbor-table delays per device."""
+    command = ["ping", "-n", "-c", "1", "-W", "1", str(ip)] if platform.system().lower() != "windows" else ["ping", "-n", "1", "-w", "1000", str(ip)]
+    try:
+        result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2, check=False)
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def arp_sweep(network):
     """Return L2-visible hosts when the Ubuntu scanner shares their subnet."""
     if platform.system().lower() == "windows":
@@ -134,8 +144,8 @@ def run_ip_status_task(task):
     targets = task.get("ips", [])
     online = []
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=64) as pool:
-            futures = {pool.submit(probe, ipaddress.ip_address(value)): value for value in targets}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=128) as pool:
+            futures = {pool.submit(ping_reachable, ipaddress.ip_address(value)): value for value in targets}
             for future in concurrent.futures.as_completed(futures):
                 if future.result():
                     online.append(futures[future])
