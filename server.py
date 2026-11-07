@@ -581,6 +581,34 @@ def upload_custom_font():
     return jsonify(name=secure_filename(upload.filename)[:120] or "Custom font", url="/api/custom-fonts/" + filename, format=signatures[ext][2]), 201
 
 
+@app.post("/api/admin/font-settings")
+@administrator
+def save_font_settings():
+    body = request.get_json(silent=True) or {}
+    family = str(body.get("uiFontFamily", "Manrope"))[:180]
+    custom_fonts = body.get("customFonts", [])
+    if not isinstance(custom_fonts, list) or len(custom_fonts) > 10:
+        return jsonify(error="Choose up to 10 uploaded fonts."), 400
+    cleaned = []
+    for font in custom_fonts:
+        if not isinstance(font, dict):
+            continue
+        url = str(font.get("url", ""))
+        if not re.fullmatch(r"/api/custom-fonts/[a-f0-9]{32}\.(?:woff2|woff|ttf|otf)", url):
+            return jsonify(error="A custom font reference is invalid."), 400
+        cleaned.append({"name": str(font.get("name", "Custom font"))[:120], "url": url,
+                        "format": str(font.get("format", "woff2"))[:12]})
+    if family.startswith("custom:") and not any(family == "custom:" + font["url"] for font in cleaned):
+        return jsonify(error="Select an uploaded font that is in the font list."), 400
+    with db() as conn:
+        row = conn.execute("SELECT value FROM app_state WHERE key='settings' FOR UPDATE").fetchone()
+        settings = row[0] if row and isinstance(row[0], dict) else {}
+        settings["uiFontFamily"] = family
+        settings["customFonts"] = cleaned
+        conn.execute("UPDATE app_state SET value=%s::jsonb,updated_at=now() WHERE key='settings'", (json.dumps(settings),))
+    return jsonify(ok=True, uiFontFamily=family, customFonts=cleaned)
+
+
 @app.get("/api/custom-fonts/<path:filename>")
 def custom_font_file(filename):
     if Path(filename).name != filename or not re.fullmatch(r"[a-f0-9]{32}\.(?:woff2|woff|ttf|otf)", filename):

@@ -1,0 +1,14 @@
+Northstar IT software-issues update
+
+Files: index.html, server.py
+
+Install on the Ubuntu app host (preserve your existing .env, uploads, database, and compose configuration):
+1. Copy both files into /opt/northstar-it, replacing the old copies.
+2. Run:
+   cd /opt/northstar-it
+   sudo docker compose build app
+   sudo docker compose up -d app
+   sudo docker compose logs --tail=50 app
+3. In the browser, hard-refresh the app (Ctrl+Shift+R).
+
+This update adds a dedicated authenticated font-preference save endpoint, so regular settings writes do not overwrite the chosen font; asset factory filtering, hardware/OS/storage/value fields, and table scrolling; employee register export and employment filters; editable factory display names (1–30 characters); and one-click device web links for assets with an IPv4 address. Current asset value and part stock value metrics are included in the UI.
