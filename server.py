@@ -133,7 +133,7 @@ def init_db():
         for statement in schema.split(";"):
             if statement.strip():
                 conn.execute(statement)
-        conn.execute("INSERT INTO app_state(key,value) VALUES('assets','[]'),('software','[]'),('departments','[]'),('maintenance','[]'),('parts_catalog','[]'),('parts_inventory','[]'),('parts_stock_entries','[]'),('parts_assignments','[]'),('manual_users','[]'),('camera_streams','[]'),('camera_profiles','[]'),('network_ranges','[]'),('network_scan','{}'),('scanner_heartbeat','{}'),('scanner_ip_status','{}'),('settings','{}'),('profile_preferences','{}'),('notifications','{\"rules\":[],\"queue\":[]}') ON CONFLICT(key) DO NOTHING")
+        conn.execute("INSERT INTO app_state(key,value) VALUES('assets','[]'),('software','[]'),('departments','[]'),('maintenance','[]'),('parts_catalog','[]'),('parts_inventory','[]'),('parts_stock_entries','[]'),('parts_assignments','[]'),('invoices','[]'),('manual_users','[]'),('camera_streams','[]'),('camera_profiles','[]'),('network_ranges','[]'),('network_scan','{}'),('scanner_heartbeat','{}'),('scanner_ip_status','{}'),('settings','{}'),('profile_preferences','{}'),('notifications','{\"rules\":[],\"queue\":[]}') ON CONFLICT(key) DO NOTHING")
 
 
 def signed_in(fn):
@@ -1888,6 +1888,121 @@ def ticket_json(row):
 
 
 TICKET_COLUMNS = "id,kind,username,display_name,department,factory,client_ip,primary_category,sub_category,description,material,attachments,assigned_to,status,eta,note,updated_at"
+
+
+INVOICE_UPLOAD_DIR = UPLOAD_DIR / "invoices"
+INVOICE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+INVOICE_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".webp", ".doc", ".docx", ".xls", ".xlsx", ".odt", ".txt"}
+
+
+def invoice_rows(conn):
+    row = conn.execute("SELECT value FROM app_state WHERE key='invoices'").fetchone()
+    return row[0] if row and isinstance(row[0], list) else []
+
+
+@app.get("/api/invoices")
+@signed_in
+def list_invoices():
+    with db() as conn:
+        rows = invoice_rows(conn)
+    return jsonify(invoices=rows)
+
+
+def save_invoice_request(invoice_id=None):
+    if not session.get("is_admin"):
+        abort(403)
+    try:
+        payload = json.loads(request.form.get("invoice", "{}"))
+    except (TypeError, ValueError):
+        return jsonify(error="Invoice details are invalid."), 400
+    if not isinstance(payload, dict):
+        return jsonify(error="Invoice details are invalid."), 400
+    number = str(payload.get("number", "")).strip()[:100]
+    if not number:
+        return jsonify(error="Invoice number is required."), 400
+    files = [f for f in request.files.getlist("files") if f and f.filename]
+    if len(files) > 5:
+        return jsonify(error="Attach up to five files per invoice."), 400
+    attachments = []
+    for upload in files:
+        ext = Path(secure_filename(upload.filename)).suffix.lower()
+        if ext not in INVOICE_EXTENSIONS:
+            return jsonify(error="Use PDF, image, Office document, ODT, or TXT attachments."), 400
+        data = upload.stream.read(10 * 1024 * 1024 + 1)
+        if not data or len(data) > 10 * 1024 * 1024:
+            return jsonify(error="Each invoice file must be 10 MB or smaller."), 400
+        if ext == ".pdf" and not data.startswith(b"%PDF-"):
+            return jsonify(error="The PDF attachment is invalid."), 400
+        if ext in (".jpg", ".jpeg") and not data.startswith(b"\xff\xd8\xff"):
+            return jsonify(error="The JPEG attachment is invalid."), 400
+        if ext == ".png" and not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return jsonify(error="The PNG attachment is invalid."), 400
+        if ext == ".webp" and not (data.startswith(b"RIFF") and data[8:12] == b"WEBP"):
+            return jsonify(error="The WebP attachment is invalid."), 400
+        safe_name = secure_filename(upload.filename)[:150] or ("attachment" + ext)
+        attachments.append((safe_name, ext, data, upload.mimetype or "application/octet-stream"))
+    with db() as conn:
+        rows = invoice_rows(conn)
+        old = next((r for r in rows if r.get("id") == invoice_id), None) if invoice_id else None
+        if invoice_id and not old:
+            abort(404)
+        if old:
+            old_files = list(old.get("attachments", []))
+            if len(old_files) + len(attachments) > 5:
+                return jsonify(error="An invoice can have up to five attachments in total."), 400
+            record = {**old, **payload, "id": invoice_id, "attachments": old_files, "updatedAt": datetime.now(timezone.utc).isoformat()}
+        else:
+            record = {**payload, "id": "inv-" + uuid.uuid4().hex, "attachments": [], "createdAt": datetime.now(timezone.utc).isoformat()}
+        folder = INVOICE_UPLOAD_DIR / record["id"]
+        folder.mkdir(parents=True, exist_ok=True)
+        for safe_name, ext, data, mime_type in attachments:
+            stored = uuid.uuid4().hex + ext
+            (folder / stored).write_bytes(data)
+            record["attachments"].append({"name": safe_name, "file": stored, "size": len(data), "type": mime_type})
+        if old:
+            rows[rows.index(old)] = record
+        else:
+            rows.insert(0, record)
+        conn.execute("INSERT INTO app_state(key,value) VALUES('invoices',%s) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", (json.dumps(rows),))
+    return jsonify(invoice=record), 200 if old else 201
+
+
+@app.post("/api/invoices")
+@signed_in
+def create_invoice():
+    return save_invoice_request()
+
+
+@app.put("/api/invoices/<invoice_id>")
+@signed_in
+def update_invoice(invoice_id):
+    return save_invoice_request(invoice_id)
+
+
+@app.get("/api/invoices/<invoice_id>/files/<filename>")
+@signed_in
+def invoice_attachment(invoice_id, filename):
+    with db() as conn:
+        record = next((r for r in invoice_rows(conn) if r.get("id") == invoice_id), None)
+    if not record:
+        abort(404)
+    attachment = next((f for f in record.get("attachments", []) if f.get("file") == filename), None)
+    if not attachment:
+        abort(404)
+    return send_from_directory(INVOICE_UPLOAD_DIR / invoice_id, filename, as_attachment=True, download_name=attachment.get("name", "invoice-attachment"), mimetype=attachment.get("type", "application/octet-stream"))
+
+
+@app.delete("/api/invoices/<invoice_id>")
+@administrator
+def delete_invoice(invoice_id):
+    with db() as conn:
+        rows = invoice_rows(conn)
+        kept = [r for r in rows if r.get("id") != invoice_id]
+        if len(kept) == len(rows):
+            abort(404)
+        conn.execute("INSERT INTO app_state(key,value) VALUES('invoices',%s) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", (json.dumps(kept),))
+    shutil.rmtree(INVOICE_UPLOAD_DIR / invoice_id, ignore_errors=True)
+    return jsonify(ok=True)
 
 
 @app.get("/api/tickets")
