@@ -2002,7 +2002,7 @@ TICKET_COLUMNS = "id,kind,username,display_name,department,factory,client_ip,pri
 
 INVOICE_UPLOAD_DIR = UPLOAD_DIR / "invoices"
 INVOICE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-INVOICE_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".webp", ".doc", ".docx", ".xls", ".xlsx", ".odt", ".txt"}
+INVOICE_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic", ".heif", ".avif", ".tif", ".tiff", ".svg", ".doc", ".docx", ".docm", ".xls", ".xlsx", ".xlsm", ".ppt", ".pptx", ".pptm", ".odt", ".ods", ".odp", ".rtf", ".txt", ".csv", ".pages", ".numbers", ".key"}
 
 
 def invoice_rows(conn):
@@ -2037,7 +2037,7 @@ def save_invoice_request(invoice_id=None):
     for upload in files:
         ext = Path(secure_filename(upload.filename)).suffix.lower()
         if ext not in INVOICE_EXTENSIONS:
-            return jsonify(error="Use PDF, image, Office document, ODT, or TXT attachments."), 400
+            return jsonify(error="Use PDF, supported image, Office, OpenDocument, Apple iWork, RTF, CSV, or TXT attachments."), 400
         data = upload.stream.read(10 * 1024 * 1024 + 1)
         if not data or len(data) > 10 * 1024 * 1024:
             return jsonify(error="Each invoice file must be 10 MB or smaller."), 400
@@ -2099,7 +2099,30 @@ def invoice_attachment(invoice_id, filename):
     attachment = next((f for f in record.get("attachments", []) if f.get("file") == filename), None)
     if not attachment:
         abort(404)
-    return send_from_directory(INVOICE_UPLOAD_DIR / invoice_id, filename, as_attachment=True, download_name=attachment.get("name", "invoice-attachment"), mimetype=attachment.get("type", "application/octet-stream"))
+    # Inline rendering is limited to formats browsers can safely preview. Keep
+    # office, Apple and other uploaded documents as downloads, regardless of
+    # a client supplied MIME type.
+    inline_types = {
+        ".pdf": "application/pdf",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".bmp": "image/bmp",
+        ".avif": "image/avif",
+    }
+    original_name = attachment.get("name", "invoice-attachment")
+    inline_mime = inline_types.get(Path(original_name).suffix.lower())
+    response = send_from_directory(
+        INVOICE_UPLOAD_DIR / invoice_id,
+        filename,
+        as_attachment=inline_mime is None,
+        download_name=original_name,
+        mimetype=inline_mime,
+    )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 
 @app.delete("/api/invoices/<invoice_id>")
