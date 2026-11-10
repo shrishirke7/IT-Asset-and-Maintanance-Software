@@ -1,0 +1,17 @@
+Northstar UI update
+==================
+
+This package contains the updated index.html only. The server/API and stored database records are unchanged.
+
+Changes included:
+- Data Center summary and category tiles open matching asset lists; each row can open the exact asset.
+- Network monitoring summary tiles open the corresponding asset list.
+- Manual part assignments can be removed with their outstanding quantity returned to the original condition and factory stock. Repair-linked parts remain tied to their repair record.
+- Vendor form and supplier list include GSTIN and Notes.
+- Repair workflow actions display Device in, Work & parts, and Completion / out.
+
+Apply on the Ubuntu server after copying index.html into /opt/northstar-it/index.html:
+  cd /opt/northstar-it
+  sudo docker compose up -d --build app
+
+Then hard-refresh the browser (Ctrl+F5). Do not replace .env or database files.
