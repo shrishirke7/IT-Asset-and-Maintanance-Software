@@ -83,6 +83,76 @@ RECOVERY_GENERIC_MESSAGE = "If the account and answers match, the password was r
 RECOVERY_DUMMY_HASH = generate_password_hash("not-a-real-recovery-answer")
 LOGIN_DUMMY_HASH = generate_password_hash("not-a-real-login-password")
 
+# Module grants are stored on each local account. A missing grant keeps the
+# account's pre-existing access for compatibility; an explicit empty mapping
+# means that a newly configured account has no module access.
+MODULE_IDS = (
+    "overview", "assets", "data_center", "surveillance", "tickets",
+    "maintenance", "ageing", "parts", "users", "departments", "software",
+    "network", "notifications", "reports", "valuation", "billing",
+)
+MODULE_DATA_KEYS = {
+    "overview": ("assets", "software", "departments", "maintenance", "parts_catalog", "parts_inventory", "parts_stock_entries", "parts_assignments", "invoices"),
+    "assets": ("assets",),
+    "data_center": ("assets", "camera_streams"),
+    "surveillance": ("assets", "camera_streams", "camera_profiles"),
+    "tickets": (),
+    "maintenance": ("assets", "maintenance", "parts_catalog", "parts_inventory", "parts_stock_entries", "parts_assignments", "departments"),
+    "ageing": ("assets", "maintenance"),
+    "parts": ("assets", "parts_catalog", "parts_inventory", "parts_stock_entries", "parts_assignments", "departments"),
+    "users": ("manual_users", "departments"),
+    "departments": ("departments", "assets", "manual_users"),
+    "software": ("software", "assets", "manual_users"),
+    "network": ("assets", "network_ranges", "network_scan", "scanner_heartbeat", "scanner_ip_status"),
+    "notifications": ("notifications",),
+    "reports": ("assets", "software", "departments", "maintenance", "parts_catalog", "parts_inventory", "parts_stock_entries", "parts_assignments", "invoices", "vendors"),
+    "valuation": ("assets", "maintenance", "parts_catalog", "parts_inventory", "parts_stock_entries", "parts_assignments", "invoices"),
+    "billing": ("invoices", "vendors", "departments", "manual_users"),
+}
+MODULE_API_PATHS = {
+    "/api/invoices": "billing", "/api/tickets": "tickets",
+    "/api/camera-profiles": "surveillance", "/api/camera-streams": "surveillance",
+    "/api/cctv-media-auth": "surveillance", "/api/network-scans": "network",
+    "/api/snmp-metrics": "network", "/api/admin/snmp-monitors": "network",
+}
+
+
+def module_permissions_for(profile):
+    if profile.get("role") == "Administrator":
+        return {module: "write" for module in MODULE_IDS}
+    explicit = profile.get("module_permissions")
+    if isinstance(explicit, dict):
+        return {module: explicit.get(module, "none") if explicit.get(module) in ("none", "read", "write") else "none" for module in MODULE_IDS}
+    if profile.get("role") == "Viewer":
+        return {module: "read" for module in MODULE_IDS}
+    if profile.get("role") == "IT Ticketing":
+        return {module: ("write" if module == "tickets" else "none") for module in MODULE_IDS}
+    # Legacy accounts were not assigned module grants. Preserve their current
+    # access until an administrator explicitly configures the account.
+    return {module: "write" for module in MODULE_IDS}
+
+
+def module_access(profile, module, write=False):
+    grant = module_permissions_for(profile).get(module, "none")
+    return grant == "write" if write else grant in ("read", "write")
+
+
+def data_key_module(key):
+    for module, keys in MODULE_DATA_KEYS.items():
+        if key in keys:
+            # Shared data is writable only through its owning module.
+            if key == "assets": return "assets"
+            if key == "departments": return "departments"
+            if key == "manual_users": return "users"
+            if key in ("software",): return "software"
+            if key.startswith("parts_"): return "parts"
+            if key == "maintenance": return "maintenance"
+            if key in ("invoices", "vendors"): return "billing"
+            if key.startswith("camera_"): return "surveillance"
+            if key.startswith("network_") or key.startswith("scanner_"): return "network"
+            if key == "notifications": return "notifications"
+    return None
+
 
 def db():
     return psycopg.connect(DATABASE_URL, connect_timeout=8)
@@ -155,6 +225,14 @@ def signed_in(fn):
         if not account or not account.get("enabled", True) or current_version != session_version:
             session.clear()
             return jsonify(error="session_expired_sign_in_again"), 401
+        # Refresh grants from the current server-side account on every request,
+        # so permission changes take effect immediately without stale sessions.
+        if isinstance(account.get("module_permissions"), dict):
+            session["profile"]["module_permissions"] = account["module_permissions"]
+        else:
+            session["profile"].pop("module_permissions", None)
+        session["profile"]["role"] = account.get("role", "User")
+        session["is_admin"] = session["profile"]["role"] == "Administrator"
         return fn(*args, **kwargs)
     return wrapper
 
@@ -173,7 +251,9 @@ def ticket_manager(fn):
     @wraps(fn)
     @signed_in
     def wrapper(*args, **kwargs):
-        if not session.get("is_admin") and session.get("profile", {}).get("role") != "IT Ticketing":
+        # Ticket reads are allowed for read-only grants; the global request
+        # guard still requires a write grant for mutations.
+        if not session.get("is_admin") and not module_access(session.get("profile", {}), "tickets"):
             abort(403)
         return fn(*args, **kwargs)
     return wrapper
@@ -190,10 +270,28 @@ def check_api_origin():
 
 
 @app.before_request
-def viewer_accounts_are_read_only():
+def enforce_module_access():
     profile = session.get("profile") or {}
-    if profile.get("role") == "Viewer" and request.path.startswith("/api/") and request.method in ("POST", "PUT", "PATCH", "DELETE") and request.path != "/api/logout":
-        return jsonify(error="Viewer accounts have read-only access."), 403
+    if not profile or session.get("is_admin") or not request.path.startswith("/api/"):
+        return None
+    path = request.path
+    if path.startswith(("/api/internal/", "/api/public/")) or path in (
+        "/api/login", "/api/logout", "/api/profile", "/api/profile/preferences",
+        "/api/account/password", "/api/account/profile-picture", "/api/account/recovery-answers",
+    ) or path.startswith("/api/recovery/"):
+        return None
+    method = request.method
+    is_write = method in ("POST", "PUT", "PATCH", "DELETE")
+    module = next((value for prefix, value in MODULE_API_PATHS.items() if path == prefix or path.startswith(prefix + "/")), None)
+    if path.startswith("/api/admin/"):
+        # Administration endpoints remain administrator-only.
+        return jsonify(error="Administrator access is required."), 403
+    if path == "/api/backups" or path.startswith("/api/backups/"):
+        return jsonify(error="Administrator access is required."), 403
+    if module:
+        if not module_access(profile, module, write=is_write):
+            return jsonify(error=("This module is read-only for your account." if is_write and module_access(profile, module) else "You do not have access to this module.")), 403
+    return None
 
 
 @app.after_request
@@ -1404,6 +1502,7 @@ def login():
             valid_local = False
         if valid_local:
             profile = {"username": str(local_user["username"]).lower(), "name": local_user.get("name") or local_user["username"], "email": local_user.get("email", ""), "dept": local_user.get("dept", ""), "site": local_user.get("site", ""), "role": local_user.get("role", "User"), "profile_picture": local_user.get("profile_picture", ""), "groups": []}
+            profile["module_permissions"] = local_user.get("module_permissions") if isinstance(local_user.get("module_permissions"), dict) else module_permissions_for(profile)
             with db() as conn:
                 conn.execute("DELETE FROM login_attempts WHERE client_ip=%s", (remote_ip,))
             session.clear()
@@ -1751,30 +1850,41 @@ def change_account_password():
 def get_data():
     who = session["profile"]
     with db() as conn:
-        keys = ("assets", "software", "departments", "maintenance", "parts_catalog", "parts_inventory", "parts_stock_entries", "parts_assignments", "vendors", "manual_users", "settings")
+        keys = ("assets", "software", "departments", "maintenance", "parts_catalog", "parts_inventory", "parts_stock_entries", "parts_assignments", "vendors", "manual_users", "settings", "camera_streams", "camera_profiles", "network_ranges", "network_scan", "scanner_heartbeat", "scanner_ip_status", "notifications")
         out = {k: (conn.execute("SELECT value FROM app_state WHERE key=%s", (k,)).fetchone() or ([],))[0] for k in keys}
         if session.get("is_admin"):
             out["users"] = [{k:v for k,v in u.items() if k not in ("password_hash", "recovery_answer_hashes")} | {"source":"manual"} for u in out.pop("manual_users", [])]
-        elif who.get("role") == "Viewer":
-            out["users"] = [{k:v for k,v in u.items() if k not in ("password_hash", "recovery_answer_hashes")} | {"source":"manual"} for u in out.pop("manual_users", [])]
         else:
-            out.pop("manual_users", None)
+            allowed = set()
+            for module, grant in module_permissions_for(who).items():
+                if grant in ("read", "write"):
+                    allowed.update(MODULE_DATA_KEYS.get(module, ()))
+            out = {key: value for key, value in out.items() if key in allowed}
+            manuals = out.pop("manual_users", [])
+            if "manual_users" in allowed:
+                out["users"] = [{k:v for k,v in u.items() if k not in ("password_hash", "recovery_answer_hashes", "module_permissions")} | {"source":"manual"} for u in manuals]
+            elif any(k in allowed for k in ("assets", "departments")):
+                out["users"] = [{k:v for k,v in u.items() if k in ("username", "name", "email", "dept", "department", "site", "role")} | {"source":"manual"} for u in manuals]
+            else:
+                out["users"] = [{k:v for k,v in who.items() if k in ("username", "name", "email", "dept", "department", "site", "role")}]
             out.pop("settings", None)
-            out["parts_inventory"] = []
-            out["parts_catalog"] = []
-            out["parts_stock_entries"] = []
-            out["parts_assignments"] = []
-            out["assets"] = [a for a in out["assets"] if str(a.get("owner", "")).casefold() in (who["username"].casefold(), who["name"].casefold(), who.get("email", "").casefold())]
-            out["software"] = []
-            out["maintenance"] = []
-            out["users"] = [who]
         return jsonify(**out)
 
 
 @app.put("/api/data")
-@administrator
+@signed_in
 def save_data():
     body = request.get_json(force=True)
+    if not isinstance(body, dict):
+        return jsonify(error="Invalid data payload."), 400
+    if not session.get("is_admin"):
+        who = session["profile"]
+        for key in body:
+            if key in ("manual_users", "settings", "camera_profiles", "network_ranges", "network_scan", "notifications"):
+                return jsonify(error="Administrator access is required for account and system settings."), 403
+            module = data_key_module(key)
+            if not module or not module_access(who, module, write=True):
+                return jsonify(error="You do not have write access to the %s module." % (module or "requested")), 403
     with db() as conn:
         for key in ("assets", "software", "departments", "maintenance", "parts_catalog", "parts_inventory", "parts_stock_entries", "parts_assignments", "vendors", "manual_users", "settings"):
             if key in body:
